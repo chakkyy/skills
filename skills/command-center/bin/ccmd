@@ -54,7 +54,17 @@ function ensureDirs() {
   for (const d of Object.values(DIRS)) { fs.mkdirSync(d, { recursive: true, mode: 0o700 }); chmodQuiet(d, 0o700); }
 }
 function readJSON(p, fallback) {
-  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
+  let raw;
+  try { raw = fs.readFileSync(p, 'utf8'); }
+  catch { return fallback; } // missing (ENOENT) etc. → silent fallback, this is normal
+  try { return JSON.parse(raw); }
+  catch (e) {
+    // Corrupt JSON is NOT normal: preserve the bytes (quarantine, never overwrite) and
+    // surface a diagnostic so it can't silently become "empty state".
+    try { fs.renameSync(p, p + '.corrupt-' + Date.now()); } catch {}
+    process.stderr.write(`ccmd: corrupt JSON quarantined -> ${p}.corrupt-* (${e.message})\n`);
+    return fallback;
+  }
 }
 function writeAtomic(p, data) {
   fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });

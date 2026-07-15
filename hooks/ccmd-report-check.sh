@@ -1,8 +1,8 @@
 #!/bin/bash
 # Command Center enforcement (Stop hook).
-# If the turn changed the repo (HEAD moved or the working tree differs from the
-# last prompt's baseline) and there's no fresh `ccmd report` for the cwd's
-# project/branch since that prompt, block the stop ONCE with instructions.
+# If the turn changed the working tree (content-sensitive fingerprint vs the last
+# prompt's baseline) and there's no fresh `ccmd report` for the cwd's project/branch
+# since that prompt, block the stop ONCE with instructions.
 # One-shot via stop_hook_active — it never loops. Also re-renders the board.
 set -u
 
@@ -33,18 +33,26 @@ case "$REPO_ROOT" in
 esac
 
 # This turn's baseline (written by ccmd-session-baseline.sh on each prompt).
-STATE="/tmp/ccmd-state-${SESSION_ID}"
+STATE_DIR="${TMPDIR:-/tmp}/ccmd-hook-$(id -u)"
+SAFE_SID=$(printf '%s' "$SESSION_ID" | tr -c 'A-Za-z0-9._-' '_')
+STATE="$STATE_DIR/state-${SAFE_SID}"
 [ -f "$STATE" ] || exit 0
 LAST_PROMPT_TS=$(grep '^last_prompt_ts=' "$STATE" | head -1 | cut -d= -f2-)
-BASE_HEAD=$(grep '^base_head=' "$STATE" | head -1 | cut -d= -f2-)
-BASE_DIRTY=$(grep '^base_dirty=' "$STATE" | head -1 | cut -d= -f2-)
+BASE_FP=$(grep '^base_fp=' "$STATE" | head -1 | cut -d= -f2-)
 [ -n "$LAST_PROMPT_TS" ] || exit 0
-[ -n "$BASE_HEAD" ] || exit 0   # prompt happened outside a repo: no enforcement
+[ -n "$BASE_FP" ] || exit 0   # prompt happened outside a repo: no enforcement
 
-# Was there work this turn? (read-only turns don't trigger)
-CUR_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "none")
-CUR_DIRTY=$(git status --porcelain 2>/dev/null | shasum | awk '{print $1}')
-[ "$CUR_HEAD" = "$BASE_HEAD" ] && [ "$CUR_DIRTY" = "$BASE_DIRTY" ] && exit 0
+# Was there work this turn? Content fingerprint (catches edits to already-dirty files).
+fp() {
+  {
+    git diff HEAD 2>/dev/null
+    git ls-files --others --exclude-standard 2>/dev/null | while IFS= read -r f; do
+      printf '\n== %s ==\n' "$f"; cat "$f" 2>/dev/null
+    done
+  } | shasum 2>/dev/null | awk '{print $1}'
+}
+CUR_FP=$(fp)
+[ "$CUR_FP" = "$BASE_FP" ] && exit 0   # read-only turn → nothing to enforce
 
 # Is there a fresh report (after the prompt) for this project/branch?
 FRESH=$("$CCMD" check --since "$LAST_PROMPT_TS" 2>/dev/null | jq -r '.fresh // false' 2>/dev/null)
