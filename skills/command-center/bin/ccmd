@@ -851,8 +851,34 @@ function cmdDemo(args) {
   process.stdout.write(`seeded demo store at ${HOME}\n  4 entries · 2 signals · 3 loops · products: ${demoProducts.map(p => p.id).join(', ')}\n  run: ccmd serve   → http://localhost:7777\n`);
 }
 
+// ---------- link (make `ccmd` a real command on PATH) ----------
+function cmdLink(args) {
+  const target = path.resolve(__filename); // this bundled binary (has the shebang + +x)
+  const candidates = args.dir ? [String(args.dir)] : [path.join(os.homedir(), '.local', 'bin'), '/usr/local/bin'];
+  const pathDirs = (process.env.PATH || '').split(path.delimiter);
+  for (const d of candidates) {
+    try {
+      fs.mkdirSync(d, { recursive: true });
+      const link = path.join(d, 'ccmd');
+      try { fs.unlinkSync(link); } catch {}
+      fs.symlinkSync(target, link);
+      process.stdout.write(`linked ccmd -> ${link}\n`);
+      if (pathDirs.includes(d)) process.stdout.write(`  ${d} is on your PATH — 'ccmd' is ready.\n`);
+      else process.stdout.write(`  ${d} is NOT on your PATH yet. Add:  export PATH="${d}:$PATH"\n`);
+      return;
+    } catch { /* try the next dir */ }
+  }
+  process.stdout.write(`could not create the link. Run ccmd by its absolute path:\n  ${target}\n`);
+}
+
+function cmdWhere() { process.stdout.write(path.resolve(__filename) + '\n'); }
+
 function cmdHelp() {
   process.stdout.write(`ccmd — Command Center (machine-wide agent status board)
+  This binary ships inside the skill and is NOT on your PATH by default. Run it by
+  absolute path, or run 'ccmd link' once to expose it as a real 'ccmd' command.
+  ccmd link [--dir <bin>]                            # symlink this binary onto PATH (~/.local/bin)
+  ccmd where                                         # print this binary's absolute path
   ccmd init [--theme swiss|terminal|soft] [--accent "#0a84ff"] [--features loops,seen,mirror] [--product "id:Label:repo1,repo2"]…
                                                      # first-run setup; no flags + a TTY => wizard
   ccmd demo                                          # seed a realistic example store (for preview/screenshots)
@@ -880,6 +906,8 @@ function main() {
   const args = parseArgs(rest);
   try {
     switch (cmd) {
+      case 'link': return cmdLink(args);
+      case 'where': return cmdWhere();
       case 'init': return cmdInit(args);
       case 'demo': return cmdDemo(args);
       case 'report': return cmdReport(args);

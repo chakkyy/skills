@@ -37,17 +37,20 @@ On first use the skill's `SKILL.md` walks the agent through interviewing you
 (products, theme, features) and running `ccmd init` — so **`ccmd: command not
 found` never happens**, because you never type `ccmd`. The agent does, by path.
 
-<details><summary>Running <code>ccmd</code> yourself in a terminal (optional)</summary>
+<details><summary>Want a real <code>ccmd</code> command? (optional, one line)</summary>
 
-Point a shell alias at the bundled binary first:
+The binary ships inside the skill and isn't on your `PATH`. To turn it into a
+first-class command, link it once — the agent can do this for you, or you can:
 
 ```bash
-# it lives at skills/command-center/bin/ccmd wherever the skill was installed
-alias ccmd="$(pwd)/skills/command-center/bin/ccmd"
-ccmd init && ccmd serve
+# from wherever the skill was installed:
+skills/command-center/bin/ccmd link      # symlinks ccmd → ~/.local/bin
+ccmd init && ccmd serve                  # now plain `ccmd` works
 ```
 
-The [hooks](hooks/) call it by absolute path (`ACC_CCMD`), so they need no alias.
+`ccmd link` prints a PATH hint if `~/.local/bin` isn't on your `PATH` yet. The
+[hooks](hooks/) call the binary by absolute path (`ACC_CCMD`), so they work with
+or without the link.
 </details>
 
 ## How it works

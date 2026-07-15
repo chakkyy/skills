@@ -7,6 +7,19 @@ exits 0 (it never blocks a hook). `project`/`branch` auto-derive from git.
 `config.json`. Set `ACC_HOME` to run against a throwaway store (tests, demos)
 without touching your real one.
 
+## Running ccmd
+
+`ccmd` ships inside the skill at `bin/ccmd` and is **not on your PATH**. Either
+run it by absolute path, or link it once:
+
+```
+ccmd link [--dir <bin>]  # symlink the binary into a PATH dir (default ~/.local/bin)
+ccmd where               # print the binary's absolute path
+```
+
+`ccmd where` is handy for agents/hooks that need the absolute path
+(`ACC_CCMD="$(…/bin/ccmd where)"`).
+
 ## Setup
 
 ```

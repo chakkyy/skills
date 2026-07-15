@@ -12,15 +12,37 @@ glance when they're back at their machine, via `ccmd serve` →
 to the store.
 
 **Source of truth = local files** under `$ACC_HOME` (default
-`~/.agents-command-center`). The CLI is `ccmd` (this skill's `bin/ccmd`, Node, no
-deps). `project` and `branch` auto-derive from git — you rarely pass them.
+`~/.agents-command-center`). `project` and `branch` auto-derive from git — you
+rarely pass them.
+
+## Running `ccmd` (read this first)
+
+`ccmd` is **not an installed CLI** — it's a Node script bundled with THIS skill at
+`bin/ccmd` (no deps). Running bare `ccmd` will fail with "command not found".
+Before your first call, resolve its absolute path **once** and reuse it:
+
+```bash
+# This skill's directory is known to you (it's where this SKILL.md was loaded from).
+CCMD="<this-skill-dir>/bin/ccmd"     # e.g. ~/.claude/skills/command-center/bin/ccmd
+# Or discover it: the binary sits next to this file, under bin/. If unsure, find it:
+#   find ~ -path '*/command-center/bin/ccmd' -type f 2>/dev/null | head -1
+```
+
+Then call it by that path from **inside the user's repo** (so git context is
+right): `"$CCMD" report …`. In every example below, `ccmd` is shorthand for that
+absolute path. Two things that make later calls plain `ccmd`:
+
+- **`"$CCMD" link`** — symlinks it onto PATH (`~/.local/bin`); after that, and for
+  the hooks, plain `ccmd` works. Offer this to the user on first setup.
+- If the user already ran `link` (or aliased it), just use `ccmd` directly.
 
 **The board is 100% generated.** The UI lives in `template/` and `ccmd` renders
 it identically for `dashboard.html`, `ccmd serve` and the optional hosted
 mirror. NEVER hand-edit board HTML, and never re-embed a UI in `bin/ccmd`.
 
 > First run: if `$ACC_HOME/config.json` doesn't exist yet, set it up before your
-> first report — see **First-run setup** at the bottom.
+> first report — see **First-run setup** at the bottom. A good first-run sequence
+> is: resolve `$CCMD` → `"$CCMD" link` → interview the user → `ccmd init …`.
 
 ## When to report (proactively, in ANY repo)
 
