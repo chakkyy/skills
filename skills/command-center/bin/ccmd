@@ -1,0 +1,907 @@
+#!/usr/bin/env node
+/*
+ * ccmd — Command Center CLI (machine-wide agent status board)
+ * A single board where every agent, across every project and session, reports
+ * what it's doing, what's blocked, and what needs you.
+ *
+ * Store:    $ACC_HOME (default ~/.agents-command-center) — your data + config.
+ * Package:  this file lives in skills/command-center/bin; the UI is in ../template.
+ * No npm deps. Every command exits 0 (never blocks a hook).
+ * See reference.md for the full command surface, SKILL.md for the agent protocol.
+ */
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const http = require('http');
+const readline = require('readline');
+const { execSync } = require('child_process');
+
+// Store lives in the user's home (or $ACC_HOME); the package is read-only.
+const HOME = process.env.ACC_HOME || path.join(os.homedir(), '.agents-command-center');
+const PKG_DIR = path.join(__dirname, '..');
+const TEMPLATE_DIR = path.join(PKG_DIR, 'template');
+const DIRS = {
+  entries: path.join(HOME, 'entries'),
+  signals: path.join(HOME, 'signals'),
+  seen: path.join(HOME, 'seen'),
+  archive: path.join(HOME, 'archive'),
+  loops: path.join(HOME, 'loops'),
+};
+const CONFIG_PATH = path.join(HOME, 'config.json');
+const DASHBOARD_PATH = path.join(HOME, 'dashboard.html');
+
+const STALE_MS = 6 * 60 * 60 * 1000; // 6h without update => greyed
+const DEFAULT_ACCENT = '#0a84ff';
+const DEFAULT_FEATURES = { loops: true, seen: true, mirror: false };
+
+// ---------- tiny utils ----------
+function ensureDirs() {
+  for (const d of Object.values(DIRS)) fs.mkdirSync(d, { recursive: true });
+}
+function readJSON(p, fallback) {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
+}
+function writeAtomic(p, data) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const tmp = p + '.tmp-' + process.pid + '-' + Date.now();
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, p);
+}
+function writeJSON(p, obj) { writeAtomic(p, JSON.stringify(obj, null, 2) + '\n'); }
+
+function defaultConfig() {
+  return {
+    products: [],
+    theme: 'swiss',
+    accent: DEFAULT_ACCENT,
+    features: Object.assign({}, DEFAULT_FEATURES),
+    mirrorUrl: null,
+    lastPresence: null,
+    staleMs: STALE_MS,
+  };
+}
+function loadConfig() {
+  const c = Object.assign(defaultConfig(), readJSON(CONFIG_PATH, {}));
+  c.features = Object.assign({}, DEFAULT_FEATURES, c.features || {});
+  if (!Array.isArray(c.products)) c.products = [];
+  return c;
+}
+function saveConfig(c) { writeJSON(CONFIG_PATH, c); }
+function feat(name) { const f = loadConfig().features; return f[name] !== false && (name in f ? f[name] : DEFAULT_FEATURES[name]); }
+
+function sh(cmd) {
+  try { return execSync(cmd, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(); }
+  catch { return ''; }
+}
+function gitTop() { return sh('git rev-parse --show-toplevel'); }
+function gitBranch() { return sh('git rev-parse --abbrev-ref HEAD'); }
+
+function slug(s) {
+  return String(s || '').replace(/[^A-Za-z0-9._@-]+/g, '_').replace(/^_+|_+$/g, '') || 'x';
+}
+// A "key" identifies a board item for read-tracking: entry:<project>/<branch> or signal:<id>
+function keyToFile(key) { return path.join(DIRS.seen, slug(key)); }
+function isSeen(key) { return fs.existsSync(keyToFile(key)); }
+function markSeen(key) { writeAtomic(keyToFile(key), new Date().toISOString() + '\n'); }
+function clearSeen(key) { try { fs.unlinkSync(keyToFile(key)); } catch {} }
+
+// ---------- arg parsing ----------
+function parseArgs(argv) {
+  const out = { _: [] };
+  const push = (k, v) => { if (k in out) { out[k] = [].concat(out[k], v); } else out[k] = v; };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      if (eq !== -1) { push(a.slice(2, eq), a.slice(eq + 1)); }
+      else if (i + 1 < argv.length && !argv[i + 1].startsWith('--')) { push(a.slice(2), argv[++i]); }
+      else { push(a.slice(2), true); }
+    } else out._.push(a);
+  }
+  return out;
+}
+// split a repeatable-ish flag: ";" or "|" separated into an array (commas stay inside the item)
+function list(v) {
+  if (v == null || v === true) return [];
+  if (Array.isArray(v)) return v.flatMap(list);
+  return String(v).split(/\s*[;|]\s*/).map(s => s.trim()).filter(Boolean);
+}
+
+function context(args) {
+  const top = gitTop();
+  const project = args.project || (top ? path.basename(top) : path.basename(process.cwd()));
+  let branch = args.branch || (top ? gitBranch() : '') || args.label || path.basename(process.cwd());
+  if (branch === 'HEAD' || !branch) branch = 'detached';
+  return { project: slug(project), branch: slug(branch), cwd: process.cwd() };
+}
+
+// ---------- commands: report / signal ----------
+function cmdReport(args) {
+  ensureDirs();
+  const { project, branch, cwd } = context(args);
+  const key = `entry:${project}/${branch}`;
+  const status = String(args.status || 'IN_PROGRESS').toUpperCase().replace(/[^A-Z_]/g, '_');
+  const entry = {
+    key, project, branch, cwd,
+    agent: args.agent || process.env.ACC_AGENT || null,
+    tier: args.tier || process.env.ACC_TIER || null,
+    status: ['IN_PROGRESS', 'BLOCKED', 'DONE'].includes(status) ? status : 'IN_PROGRESS',
+    summary: args.summary || null,   // one sentence: what is happening NOW, with context
+    task: args.task || null,         // ticket / PR / feature in flight
+    progress: args.progress || null, // short progress: "PR #29 · CI green", "3/5 sections"
+    done: list(args.done),
+    inFlight: list(args['in-flight'] || args.inflight),
+    next: list(args.next),
+    blockedOn: list(args.blocked || args['blocked-on']),
+    note: args.note || null,
+    updatedAt: new Date().toISOString(),
+  };
+  const file = path.join(DIRS.entries, project, slug(branch) + '.json');
+  writeJSON(file, entry);
+  clearSeen(key); // a fresh update re-surfaces the row
+  process.stdout.write(`reported ${project}/${branch} [${entry.status}]\n`);
+}
+
+function cmdSignal(args) {
+  ensureDirs();
+  const { project, branch } = context(args);
+  const kind = (args.kind || 'blocker').toLowerCase() === 'question' ? 'question' : 'blocker';
+  const msg = args.msg || args.message || args._[0] || '(no message)';
+  const id = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+  const sig = {
+    key: `signal:${id}`, id, kind, project, branch,
+    msg: String(msg),
+    createdAt: new Date().toISOString(),
+    resolved: false,
+  };
+  writeJSON(path.join(DIRS.signals, id + '.json'), sig);
+  process.stdout.write(`${id}\n`); // print id so the agent can `ccmd resolve <id>`
+}
+
+function cmdResolve(args) {
+  const id = args._[0];
+  if (!id) { process.stdout.write('usage: ccmd resolve <id>\n'); return; }
+  const p = path.join(DIRS.signals, slug(id) + '.json');
+  const sig = readJSON(p, null);
+  if (!sig) { process.stdout.write(`no such signal: ${id}\n`); return; }
+  sig.resolved = true;
+  sig.resolvedAt = new Date().toISOString();
+  writeJSON(path.join(DIRS.archive, 'signal-' + id + '.json'), sig);
+  try { fs.unlinkSync(p); } catch {}
+  clearSeen(`signal:${id}`);
+  process.stdout.write(`resolved ${id}\n`);
+}
+
+// ---------- loops: curated async work, ready to be run unattended ----------
+// A "loop" is a chunk of agentic work that can run for hours without you.
+// Agents curate the full prompt + specs/links and shelve it here (grouped by
+// product) so you can kick one off any time. (Toggle: features.loops)
+function cmdLoop(args) {
+  if (!feat('loops')) { process.stdout.write('loops feature is off (set features.loops=true in config.json)\n'); return; }
+  ensureDirs();
+  fs.mkdirSync(DIRS.loops, { recursive: true });
+  if (args._[0] === 'add') args._.shift(); // `ccmd loop add …` sugar == `ccmd loop …`
+  if (args.done) {
+    const p = path.join(DIRS.loops, slug(String(args.done)).toLowerCase().slice(0, 48) + '.json');
+    const it = readJSON(p, null);
+    if (!it) { process.stdout.write(`no such loop: ${args.done}\n`); return; }
+    it.status = 'done'; it.updatedAt = new Date().toISOString();
+    writeJSON(path.join(DIRS.archive, 'loop-' + it.id + '.json'), it);
+    try { fs.unlinkSync(p); } catch {}
+    process.stdout.write(`loop done ${it.id}\n`); return;
+  }
+  const idForTitle = args.id ? slug(String(args.id)).toLowerCase().slice(0, 48) : null;
+  const prevForTitle = idForTitle ? readJSON(path.join(DIRS.loops, idForTitle + '.json'), {}) : {};
+  const title = args.title || args._[0] || prevForTitle.title;
+  if (!title) {
+    process.stdout.write('usage: ccmd loop --title "…" --summary "…" [--prompt-path <file>] [--links "url;url"] [--prereqs "…"] [--hours N] [--status ready|waiting|draft] [--project p] [--id slug] | ccmd loop --done <id>\n');
+    return;
+  }
+  const { project } = context(args);
+  const id = slug(String(args.id || title)).toLowerCase().slice(0, 48);
+  const p = path.join(DIRS.loops, id + '.json');
+  const prev = readJSON(p, {});
+  const status = String(args.status || prev.status || 'draft').toLowerCase();
+  // waiting = curated & complete but a prereq is unmet (neither ready nor draft).
+  const item = Object.assign({}, prev, {
+    id,
+    project: args.project || prev.project || project,
+    title,
+    summary: args.summary !== undefined ? String(args.summary) : (prev.summary || ''),
+    promptPath: args['prompt-path'] !== undefined ? String(args['prompt-path']) : (prev.promptPath || null),
+    links: list(args.links).length ? list(args.links) : (prev.links || []),
+    prereqs: args.prereqs !== undefined ? String(args.prereqs) : (prev.prereqs || null),
+    hours: args.hours !== undefined ? String(args.hours) : (prev.hours || null),
+    status: ['ready', 'waiting', 'draft', 'done'].includes(status) ? status : 'draft',
+    createdAt: prev.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+  writeJSON(p, item);
+  process.stdout.write(`loop ${item.id} [${item.status}]\n`);
+}
+
+function cmdSeen(args) { const k = args._[0]; if (k) { markSeen(k); process.stdout.write(`seen ${k}\n`); } }
+function cmdUnseen(args) { const k = args._[0]; if (k) { clearSeen(k); process.stdout.write(`unseen ${k}\n`); } }
+
+function cmdSetUrl(args) {
+  const url = args._[0] || args.url;
+  const c = loadConfig();
+  c.mirrorUrl = url || null;
+  saveConfig(c);
+  process.stdout.write(`mirrorUrl = ${c.mirrorUrl}\n`);
+}
+function cmdGetUrl() { process.stdout.write((loadConfig().mirrorUrl || '') + '\n'); }
+
+// ccmd check --since <epoch_ms>: does the cwd's entry exist and is it newer than --since?
+// Used by the Stop enforcement hook. Always exits 0.
+function cmdCheck(args) {
+  const { project, branch } = context(args);
+  const file = path.join(DIRS.entries, project, branch + '.json');
+  let exists = false, mtimeMs = null;
+  try { const st = fs.statSync(file); exists = true; mtimeMs = Math.round(st.mtimeMs); } catch {}
+  const since = Number(args.since || 0) || 0;
+  const fresh = exists && (since ? mtimeMs >= since : true);
+  process.stdout.write(JSON.stringify({ project, branch, file, exists, mtimeMs, fresh }) + '\n');
+}
+
+// ---------- gather board state from disk ----------
+function safeReaddir(d) { try { return fs.readdirSync(d); } catch { return []; } }
+function collect() {
+  ensureDirs();
+  const entries = [];
+  const projRoot = DIRS.entries;
+  for (const proj of safeReaddir(projRoot)) {
+    for (const f of safeReaddir(path.join(projRoot, proj))) {
+      if (!f.endsWith('.json')) continue;
+      const e = readJSON(path.join(projRoot, proj, f), null);
+      if (e) { e.seen = isSeen(e.key); entries.push(e); }
+    }
+  }
+  const signals = [];
+  for (const f of safeReaddir(DIRS.signals)) {
+    if (!f.endsWith('.json')) continue;
+    const s = readJSON(path.join(DIRS.signals, f), null);
+    if (s && !s.resolved) { s.seen = isSeen(s.key); signals.push(s); }
+  }
+  return { entries, signals };
+}
+
+function cmdPrune(args) {
+  const { entries } = collect();
+  let archived = 0;
+  for (const e of entries) {
+    if (e.status === 'DONE' || e.seen) {
+      const src = path.join(DIRS.entries, e.project, slug(e.branch) + '.json');
+      writeJSON(path.join(DIRS.archive, `entry-${e.project}-${slug(e.branch)}-${Date.now()}.json`), e);
+      try { fs.unlinkSync(src); } catch {}
+      clearSeen(e.key);
+      archived++;
+    }
+  }
+  if (args.presence) { const c = loadConfig(); c.lastPresence = new Date().toISOString(); saveConfig(c); }
+  cmdRender({ quiet: true });
+  if (!args.quiet) process.stdout.write(`pruned ${archived} entr${archived === 1 ? 'y' : 'ies'}\n`);
+}
+
+// ---------- products (grouping of repos, from config) ----------
+function products() {
+  const cfg = loadConfig();
+  return (cfg.products || []).map(p => ({
+    id: slug(p.id || p.label || 'product'),
+    label: p.label || p.id || 'Product',
+    icon: p.icon || 'compass',
+    repos: Array.isArray(p.repos) ? p.repos : [],
+  }));
+}
+function productFor(proj) {
+  return products().find(p => p.repos.includes(proj)) ||
+    { id: slug(proj), label: proj, icon: 'compass', repos: [proj] };
+}
+function productOrder(id) { const arr = products(); const i = arr.findIndex(x => x.id === id); return i === -1 ? 99 : i; }
+
+// ---------- board model (shared by buildHTML and `ccmd data`) ----------
+function timeAgo(iso) {
+  const ms = Date.now() - new Date(iso).getTime();
+  const m = Math.round(ms / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+// Autolink URLs over already-escaped text (the &amp; inside an href is valid HTML).
+function linkify(escaped) {
+  return escaped.replace(/https?:\/\/[^\s<]+/g, u => {
+    const label = u.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    return `<a class="prlink" href="${u}" target="_blank" rel="noreferrer">${label}</a>`;
+  });
+}
+
+// UI status: worst state wins. stale (no update > staleMs, not DONE) => idle.
+function uiStatus(e, staleMs, now) {
+  const stale = e.status !== 'DONE' && (now - new Date(e.updatedAt).getTime()) > staleMs;
+  if (stale) return { cls: 'idle', label: 'No signal · ' + timeAgo(e.updatedAt), stale: true };
+  if (e.status === 'BLOCKED') return { cls: 'need', label: 'Needs you', stale: false };
+  if (e.status === 'DONE') return { cls: 'ready', label: 'Ready', stale: false };
+  return { cls: 'doing', label: 'In progress', stale: false };
+}
+const CLS_RANK = { need: 0, doing: 1, ready: 2, idle: 3 };
+
+// Overview = triage: one line per item; the detail lives in the product's tab.
+function brief(text, max = 110) {
+  const s = String(text || '').replace(/\s+/g, ' ').trim();
+  const dot = s.indexOf('. ');
+  if (dot > 24 && dot < max) return s.slice(0, dot + 1);
+  return s.length > max ? s.slice(0, max - 1).trimEnd() + '…' : s;
+}
+
+function boardModel() {
+  const { entries, signals } = collect();
+  const cfg = loadConfig();
+  const staleMs = cfg.staleMs || STALE_MS;
+  const now = Date.now();
+  const visEntries = entries.filter(e => !e.seen)
+    .map(e => Object.assign({}, e, { ui: uiStatus(e, staleMs, now) }))
+    .sort((a, b) => (CLS_RANK[a.ui.cls] - CLS_RANK[b.ui.cls]) || (a.updatedAt < b.updatedAt ? 1 : -1));
+  const visSignals = signals.filter(s => !s.seen)
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+
+  const groups = new Map();
+  const groupFor = (proj) => {
+    const p = productFor(proj);
+    if (!groups.has(p.id)) groups.set(p.id, { id: p.id, label: p.label, icon: p.icon, repos: p.repos, entries: [], signals: [] });
+    return groups.get(p.id);
+  };
+  for (const e of visEntries) groupFor(e.project).entries.push(e);
+  for (const s of visSignals) groupFor(s.project).signals.push(s);
+
+  const grouped = Array.from(groups.values());
+  for (const g of grouped) {
+    const present = new Set(g.entries.map(e => e.project).concat(g.signals.map(s => s.project)));
+    g.reposLine = Array.from(present).join(' · ');
+    const worst = g.signals.length || g.entries.some(e => e.ui.cls === 'need') ? ['need', 'Needs you']
+      : g.entries.some(e => e.ui.cls === 'doing') ? ['doing', 'In progress']
+      : g.entries.some(e => e.ui.cls === 'ready') ? ['ready', 'Ready']
+      : ['idle', 'No signal'];
+    g.summaryStatus = worst;
+    const latest = g.entries.slice().sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1))[0];
+    g.summaryLine = (g.signals[0] && g.signals[0].msg) || (latest && latest.summary) || '';
+    const q = g.signals.filter(s => s.kind === 'question').length;
+    const bl = g.signals.length - q;
+    const doing = g.entries.filter(e => e.ui.cls === 'doing').length;
+    const ready = g.entries.filter(e => e.ui.cls === 'ready').length;
+    g.countsLine = [
+      q ? `${q} question${q > 1 ? 's' : ''}` : '',
+      bl ? `${bl} blocker${bl > 1 ? 's' : ''}` : '',
+      doing ? `${doing} in progress` : '',
+      ready ? `${ready} to review` : '',
+    ].filter(Boolean).join(' · ') || 'nothing pending';
+  }
+  grouped.sort((a, b) => (CLS_RANK[a.summaryStatus[0]] - CLS_RANK[b.summaryStatus[0]]) || a.label.localeCompare(b.label));
+
+  // Overview priorities: ONE line per item (brief) + jump to the product tab for detail.
+  const prio = [];
+  for (const s of visSignals) {
+    prio.push({
+      t: brief(s.msg),
+      d: `<code>${esc(productFor(s.project).label)}</code> · ${s.kind === 'question' ? 'question' : 'blocker'} · ${timeAgo(s.createdAt)} · detail in its tab`,
+      jump: productFor(s.project).id,
+      target: s.key,
+    });
+  }
+  for (const e of visEntries.filter(e => e.ui.cls === 'need')) {
+    const why = (e.blockedOn && e.blockedOn.length) ? esc(brief(e.blockedOn.join(' · '), 80)) + ' · ' : '';
+    prio.push({ t: brief((e.task || e.branch) + ': blocked'), d: `${why}<code>${esc(productFor(e.project).label)}</code>`, jump: productFor(e.project).id, target: e.key });
+  }
+  for (const e of visEntries.filter(e => e.ui.cls === 'ready' && e.next && e.next.length)) {
+    prio.push({ t: brief((e.task || e.branch) + ': ready, your turn'), d: `${esc(brief(e.next.join(' · '), 80))} · <code>${esc(productFor(e.project).label)}</code>`, jump: productFor(e.project).id, target: e.key });
+  }
+  prio.length = Math.min(prio.length, 6);
+
+  const stats = [
+    { v: grouped.length, l: 'products reporting' },
+    { v: visEntries.filter(e => e.ui.cls === 'doing').length, l: 'fronts in progress' },
+    { v: visSignals.length + visEntries.filter(e => e.ui.cls === 'need').length, l: 'need your eyes' },
+    { v: visEntries.filter(e => e.status === 'DONE').length, l: 'ready to review' },
+  ];
+
+  const LOOP_RANK = { ready: 0, waiting: 1, draft: 2 };
+  const loops = feat('loops') ? safeReaddir(DIRS.loops)
+    .filter(f => f.endsWith('.json'))
+    .map(f => readJSON(path.join(DIRS.loops, f), null))
+    .filter(Boolean)
+    .filter(n => n.status !== 'done')
+    .sort((a, b) => ((LOOP_RANK[a.status] ?? 9) - (LOOP_RANK[b.status] ?? 9)) || (a.updatedAt < b.updatedAt ? 1 : -1)) : [];
+
+  return { products: grouped, entries: visEntries, signals: visSignals, prio, stats, staleMs, now, loops, cfg };
+}
+
+// ---------- rendering ----------
+function loadTpl(name) {
+  try { return fs.readFileSync(path.join(TEMPLATE_DIR, name), 'utf8'); } catch { return null; }
+}
+let ICONS = null;
+function icons() {
+  if (!ICONS) {
+    try { ICONS = require(path.join(TEMPLATE_DIR, 'icons.js')); }
+    catch { ICONS = { ICON: {}, STEP: {}, UI: { moon: '', sun: '', check: '', chevron: '', external: '' } }; }
+  }
+  return ICONS;
+}
+let THEMES = null;
+function themes() {
+  if (!THEMES) { try { THEMES = require(path.join(TEMPLATE_DIR, 'themes.js')); } catch { THEMES = { themeVars: () => '' }; } }
+  return THEMES;
+}
+
+function entryCard(e, prodIcon, showAck) {
+  const { UI } = icons();
+  const metabits = [];
+  if (e.progress) metabits.push(esc(e.progress));
+  for (const x of (e.inFlight || [])) metabits.push(esc(x));
+  if (e.done && e.done.length) metabits.push(`<b>${e.done.length} ✓</b> · ${esc(e.done[e.done.length - 1])}`);
+  const meta = [e.project, e.branch, e.agent, e.tier].filter(Boolean).join(' · ');
+  return `<article class="card${e.ui.stale ? ' stale' : ''}" data-ack="${esc(e.key)}">
+    <div class="chead">
+      <span class="pic">${prodIcon}</span>
+      <div style="min-width:0"><div class="ct">${esc(e.task || e.branch)}</div><div class="cm">${esc(meta)} · ${timeAgo(e.updatedAt)}</div></div>
+      <span style="margin-left:auto"><span class="status ${e.ui.cls}"><span class="d"></span>${esc(e.ui.label)}</span></span>
+    </div>
+    ${e.summary ? `<p class="body">${linkify(esc(e.summary))}</p>` : ''}
+    ${metabits.length ? `<div class="metaline">${metabits.map(m => `<span>${m}</span>`).join('')}</div>` : ''}
+    ${(e.blockedOn && e.blockedOn.length) ? `<div class="youmove"><div class="lbl">Your move</div><div class="txt">${esc(e.blockedOn.join(' · '))}</div></div>` : ''}
+    ${(e.next && e.next.length) ? `<div class="detail"><span class="arw">Next</span> · ${esc(e.next.join(' · '))}</div>` : ''}
+    ${e.note ? `<div class="cfoot">${linkify(esc(e.note))}</div>` : ''}
+    ${showAck ? `<div class="ackrow"><button class="ack" type="button" data-key="${esc(e.key)}"><span class="box">${UI.check}</span><span class="lab">Mark read</span></button></div>` : ''}
+  </article>`;
+}
+
+function signalCard(s, prodIcon, showAck) {
+  const { UI } = icons();
+  return `<article class="card" data-ack="${esc(s.key)}">
+    <div class="chead">
+      <span class="pic">${prodIcon}</span>
+      <div style="min-width:0"><div class="ct">${s.kind === 'question' ? 'Open question' : 'Blocker'}</div><div class="cm">${esc(s.project)} · ${esc(s.branch)} · ${timeAgo(s.createdAt)}</div></div>
+      <span style="margin-left:auto"><span class="status need"><span class="d"></span>Needs you</span></span>
+    </div>
+    <p class="body">${linkify(esc(s.msg))}</p>
+    <div class="cfoot">clear with <code class="k">ccmd resolve ${esc(s.id)}</code></div>
+    ${showAck ? `<div class="ackrow"><button class="ack" type="button" data-key="${esc(s.key)}"><span class="box">${UI.check}</span><span class="lab">Mark read</span></button></div>` : ''}
+  </article>`;
+}
+
+function buildHTML({ interactive, fragment }) {
+  const css = loadTpl('style.css');
+  const js = loadTpl('client.js');
+  if (!css || !js) {
+    const msg = '<style>body{font-family:system-ui;padding:48px;color:#333}</style>' +
+      '<p><b>Command Center:</b> the template is missing (skills/command-center/template/style.css and client.js). Restore it to render the board.</p>';
+    return fragment ? msg : `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Command Center</title></head><body>${msg}</body></html>`;
+  }
+  const { ICON, STEP, UI } = icons();
+  const iconFor = (name) => ICON[name] || ICON.compass || '';
+  const m = boardModel();
+  const showLoops = feat('loops');
+  const showAck = feat('seen');
+  const hasData = m.entries.length || m.signals.length;
+
+  // --- tabs
+  const tabDefs = [{ id: 'overview', label: 'Overview' }]
+    .concat(m.products.map(p => ({ id: p.id, label: p.label })));
+  if (showLoops) tabDefs.push({ id: 'loops', label: `Loops${m.loops.length ? ` · ${m.loops.filter(n => n.status === 'ready').length}` : ''}` });
+  tabDefs.push({ id: 'command-center', label: 'Command Center' });
+  const segHTML = tabDefs.map((t, i) =>
+    `<button role="tab" data-tab="${esc(t.id)}" aria-selected="${i === 0}">${esc(t.label)}</button>`).join('');
+
+  // --- panel: overview
+  const prioHTML = m.prio.length
+    ? m.prio.map((r, i) => `<button class="row" type="button" data-jump="${esc(r.jump)}"${r.target ? ` data-target="${esc(r.target)}"` : ''} title="See the detail in the tab"><div class="num">${i + 1}</div><div style="min-width:0"><div class="t">${esc(r.t)}</div><div class="d">${r.d}</div></div><span class="chev">${UI.chevron}</span></button>`).join('')
+    : `<div class="empty">Nothing waiting on you right now. Blockers and questions land here.</div>`;
+  const statsHTML = m.stats.map(s => `<div class="stat"><div class="v">${s.v}</div><div class="l">${esc(s.l)}</div></div>`).join('');
+  const plistHTML = m.products.map(p => `
+        <button class="pcard" data-jump="${esc(p.id)}">
+          <span class="pic">${iconFor(p.icon)}</span>
+          <span class="pmain"><span class="pn">${esc(p.label)}</span><span class="pr"><b>${esc(p.countsLine)}</b>${p.summaryLine ? ' — ' + esc(brief(p.summaryLine, 90)) : ''}</span></span>
+          <span class="pside"><span class="status ${p.summaryStatus[0]}"><span class="d"></span>${esc(p.summaryStatus[1])}</span><span class="chev">${UI.chevron}</span></span>
+        </button>`).join('');
+  const overviewHTML = `<div class="panel on" role="tabpanel" data-tab="overview">
+    ${hasData ? `
+    <section>
+      <p class="kick">For you · when you're back</p>
+      <div class="prio">${prioHTML}</div>
+    </section>
+    <section>
+      <p class="kick">At a glance</p>
+      <div class="stats">${statsHTML}</div>
+    </section>
+    <section>
+      <p class="kick">Status by product</p>
+      <div class="plist">${plistHTML}</div>
+    </section>` : `
+    <div class="void">
+      <p class="vt">No agents reporting</p>
+      <p class="vs">Cards show up here when an agent runs <code>ccmd report</code> or <code>ccmd signal</code>.</p>
+    </div>`}
+  </div>`;
+
+  // --- panels: products
+  const prodPanels = m.products.map(p => {
+    const cards = p.signals.map(s => signalCard(s, iconFor(p.icon), showAck)).join('')
+      + p.entries.map(e => entryCard(e, iconFor(p.icon), showAck)).join('');
+    return `<div class="panel" role="tabpanel" data-tab="${esc(p.id)}" hidden>
+      <p class="kick">${esc(p.label)} · ${esc(p.reposLine)}</p>
+      <div class="stack">${cards}</div>
+    </div>`;
+  }).join('');
+
+  // --- panel: loops (curated async work backlog)
+  let loopsHTML = '';
+  if (showLoops) {
+    const LOOP_UI = {
+      ready: ['ready', 'Ready to run'],
+      waiting: ['idle', 'Waiting on prereq'],
+      draft: ['doing', 'Drafting'],
+    };
+    const loopCard = (n, prod) => {
+      const ui = LOOP_UI[n.status] || LOOP_UI.draft;
+      const metaBits = [n.hours ? `~${esc(String(n.hours))} h` : null, timeAgo(n.updatedAt)].filter(Boolean).join(' · ');
+      const links = (n.links || []).map(u => linkify(esc(u))).join(' · ');
+      return `<article class="card">
+      <div class="chead">
+        <span class="pic">${iconFor(prod.icon)}</span>
+        <div style="min-width:0"><div class="ct">${esc(n.title)}</div><div class="cm">${metaBits}</div></div>
+        <span style="margin-left:auto"><span class="status ${ui[0]}"><span class="d"></span>${ui[1]}</span></span>
+      </div>
+      ${n.summary ? `<p class="body">${linkify(esc(n.summary))}</p>` : ''}
+      ${n.prereqs ? `<div class="youmove"><div class="lbl">Before running</div><div class="txt">${esc(n.prereqs)}</div></div>` : ''}
+      ${n.promptPath ? `<div class="nprompt"><span class="lbl">Prompt</span><code class="k">${esc(n.promptPath)}</code></div>` : ''}
+      ${links ? `<div class="cfoot">${links}</div>` : ''}
+      <div class="cfoot" style="opacity:.75">paste the prompt into an agent session and walk away · when it's done: <code class="k">ccmd loop --done ${esc(n.id)}</code></div>
+    </article>`;
+    };
+    const loopGroups = [];
+    for (const n of m.loops) {
+      const prod = productFor(n.project);
+      let g = loopGroups.find(x => x.prod.id === prod.id);
+      if (!g) { g = { prod, items: [] }; loopGroups.push(g); }
+      g.items.push(n);
+    }
+    loopGroups.sort((a, b) => productOrder(a.prod.id) - productOrder(b.prod.id));
+    const loopCards = loopGroups.map((g, gi) => {
+      const ready = g.items.filter(n => n.status === 'ready').length;
+      const head = `<p class="kick" style="margin:${gi === 0 ? '0' : '30px'} 0 12px">${esc(g.prod.label)} · ${g.items.length} loop${g.items.length === 1 ? '' : 's'}${ready ? ` · ${ready} ready` : ''}</p>`;
+      return head + `<div class="stack">${g.items.map(n => loopCard(n, g.prod)).join('')}</div>`;
+    }).join('');
+    loopsHTML = `<div class="panel" role="tabpanel" data-tab="loops" hidden>
+      <p class="kick">Loops · curated async work, ready to pull down</p>
+      <h2>Work that runs while you sleep.</h2>
+      <p class="sub">Agents spot the work that can run for hours without you, curate the full prompt with specs and links, and shelve it here. You pick one any night, paste the prompt, and go — your live hours stay for the synchronous work.</p>
+      ${m.loops.length ? loopCards : `<div class="void"><p class="vt">No loops on the shelf</p><p class="vs">When an agent finds async-able work it leaves it here with <code>ccmd loop</code>.</p></div>`}
+    </div>`;
+  }
+
+  // --- panel: command center (static meta)
+  const flow = [
+    { i: STEP.report, t: 'Agents report themselves', d: 'Every agent runs <code>ccmd report</code> when it closes a turn. An optional Stop hook blocks the close if the repo changed and nothing was reported.' },
+    { i: STEP.build, t: 'The board is generated from the store', d: 'Everything you see comes from <code>entries/</code> and <code>signals/</code>. Nobody hand-edits HTML — the UI lives in <code>template/</code> and renders identically everywhere.' },
+    { i: STEP.read, t: 'You mark what you read', d: 'Tap "Mark read" on a card. On <code>ccmd serve</code> it persists instantly; elsewhere "Copy what I read" builds a <code>ccmd-read: …</code> line with the real keys.' },
+    { i: STEP.loop, t: 'The circle closes', d: 'Paste that line into any agent chat; it runs <code>ccmd seen</code> per key and the board drops those items.' },
+  ];
+  const flowSteps = showAck ? flow : flow.filter(s => s !== flow[2] && s !== flow[3]);
+  const changelog = [
+    { ver: 'now', t: 'Generated from the store, one UI', d: 'The board is 100% data-driven and renders identically for the local dashboard, the live server and an optional hosted mirror.', bullets: [
+      'Overview = triage: one line per item and per-product counts; the full detail lives in each product tab, and every Overview card jumps to it.',
+      'Cards come straight from <code>ccmd report</code> / <code>ccmd signal</code>, with the real store keys.',
+      'Three themes (swiss / terminal / soft) + a custom accent, injected as CSS variables at render time.',
+      'Feature toggles (loops / read-relay / mirror) turn tabs, commands and board sections on and off.',
+    ] },
+    { ver: 'why', t: 'We moved to local-first', d: 'This started life publishing an HTML mirror to a hosted artifact every turn. That was pure overhead — re-uploading the whole board on every report. The live <code>ccmd serve</code> at localhost is now the default; the mirror survives only as an optional adapter for teams that want a shared URL.', bullets: [] },
+  ];
+  const commandCenterHTML = `<div class="panel" role="tabpanel" data-tab="command-center" hidden>
+    <p class="kick">Command Center · the meta-project</p>
+    <h2>The loop, in ${showAck ? 'four' : 'two'} steps</h2>
+    <p class="sub">How state flows from the agents to your eyes, and back.</p>
+    <div class="flow">${flowSteps.map(s => `<div class="step"><span class="i">${s.i}</span><div><div class="t">${s.t}</div><div class="d">${s.d}</div></div></div>`).join('')}</div>
+    <p class="kick">Changelog</p>
+    <div class="log">${changelog.map(c => `<div class="logitem"><div class="lh"><span class="ver">${c.ver}</span><span class="lt">${c.t}</span></div><p class="ld">${c.d}</p>${c.bullets.length ? `<ul>${c.bullets.map(b => `<li>${b}</li>`).join('')}</ul>` : ''}</div>`).join('')}</div>
+  </div>`;
+
+  // --- header + shell
+  const nowIso = new Date().toISOString();
+  const updated = `Generated ${nowIso.slice(0, 10)} ${nowIso.slice(11, 16)} UTC · ${m.entries.length} ${m.entries.length === 1 ? 'agent' : 'agents'} · ${m.signals.length} ${m.signals.length === 1 ? 'signal' : 'signals'}`;
+  const relayBlock = showAck ? `
+<div class="relay" aria-live="polite">
+  <span class="rc"><b class="rn">0</b> read</span>
+  <button class="copy" type="button">Copy what I read</button>
+  <button class="clear" type="button" title="Undo marks in this browser">clear</button>
+</div>
+<div class="relaybox">
+  <p class="rbl">Selected. Copy with ⌘C / Ctrl-C and paste it into any agent chat; it drops these items from the board.</p>
+  <textarea readonly rows="2" spellcheck="false"></textarea>
+</div>
+<div class="toast" role="status" aria-live="polite"></div>` : '';
+  const bodyBlock = `<div class="wrap">
+  <header class="top">
+    <div class="bar">
+      <p class="eyebrow">Command Center</p>
+      <button class="tt" id="themeToggle" type="button" aria-label="Toggle light/dark">${UI.moon}${UI.sun}</button>
+    </div>
+    <h1 class="title">Where everything is, and what needs you.</h1>
+    <p class="lede">A board of your agents, grouped by product. It generates itself from their reports; you mark what you read.</p>
+    <p class="updated">${esc(updated)}</p>
+  </header>
+  <div class="segwrap"><div class="seg" role="tablist" aria-label="Sections" id="seg">${segHTML}</div></div>
+  <main id="panels">${overviewHTML}${prodPanels}${loopsHTML}${commandCenterHTML}</main>
+  <footer><span>Command Center · generated by ccmd</span><span>${showAck ? 'mark read and "Copy what I read" to clear items' : 'open-source agent status board'}</span></footer>
+</div>${relayBlock}`;
+
+  const themeCss = themes().themeVars(m.cfg.theme, m.cfg.accent);
+  const styleBlock = `<style>\n${css}\n${themeCss}</style>`;
+  const scriptBlock = `<script>window.CC_MODE={interactive:${interactive ? 'true' : 'false'}};</script>\n<script>\n${js}\n</script>`;
+
+  if (fragment) return `<title>Command Center</title>\n${styleBlock}\n${bodyBlock}\n${scriptBlock}`;
+
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Command Center</title>
+${styleBlock}</head>
+<body>${bodyBlock}${scriptBlock}</body></html>`;
+}
+
+function cmdRender(args) {
+  const html = buildHTML({ interactive: true });
+  writeAtomic(DASHBOARD_PATH, html);
+  if (!args || !args.quiet) process.stdout.write(`rendered -> ${DASHBOARD_PATH}\n`);
+}
+
+function cmdMirror(args) {
+  if (!feat('mirror')) { process.stdout.write('mirror feature is off (set features.mirror=true in config.json)\n'); return; }
+  const out = args.out || path.join(HOME, 'mirror.html');
+  const html = buildHTML({ interactive: false, fragment: !!args.fragment });
+  writeAtomic(out, html);
+  const c = loadConfig(); c.lastMirrorAt = new Date().toISOString(); saveConfig(c);
+  process.stdout.write(out + '\n');
+}
+
+// ---------- data (JSON of the board model, for debug/other consumers) ----------
+function cmdData() {
+  const m = boardModel();
+  const out = {
+    updated: new Date().toISOString(),
+    stats: m.stats,
+    prio: m.prio.map(r => ({ t: r.t })),
+    products: m.products.map(g => ({
+      id: g.id, label: g.label, repos: g.reposLine,
+      status: g.summaryStatus, summary: g.summaryLine,
+      items: g.entries.map(e => ({
+        key: e.key, title: e.task || e.branch,
+        meta: [e.project, e.branch, e.agent].filter(Boolean).join(' · '),
+        status: [e.ui.cls, e.ui.label], body: e.summary || '',
+        progress: e.progress || null, inFlight: e.inFlight, next: e.next, blockedOn: e.blockedOn, note: e.note || null,
+      })),
+      signals: g.signals.map(s => ({ key: s.key, kind: s.kind, msg: s.msg, where: `${s.project}/${s.branch}`, id: s.id })),
+    })),
+  };
+  process.stdout.write(JSON.stringify(out, null, 2) + '\n');
+}
+
+// ---------- server ----------
+function cmdServe(args) {
+  ensureDirs();
+  const port = parseInt(args.port || process.env.ACC_PORT || '7777', 10);
+  const server = http.createServer((req, res) => {
+    if (req.method === 'POST' && (req.url === '/seen' || req.url === '/unseen')) {
+      let body = '';
+      req.on('data', c => { body += c; if (body.length > 1e5) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const { key } = JSON.parse(body || '{}');
+          if (key) (req.url === '/seen' ? markSeen : clearSeen)(key);
+        } catch {}
+        res.writeHead(204).end();
+      });
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(buildHTML({ interactive: true }));
+  });
+  server.on('error', (e) => { process.stderr.write(`serve error: ${e.message}\n`); process.exit(0); });
+  server.listen(port, '127.0.0.1', () => {
+    process.stdout.write(`Command Center → http://localhost:${port}\n`);
+  });
+}
+
+// ---------- init (first-run setup: wizard OR non-interactive flags) ----------
+const THEME_NAMES = ['swiss', 'terminal', 'soft'];
+function parseProductArg(v) {
+  // "id:Label:repo1,repo2"  or  "id:Label:icon:repo1,repo2"
+  const items = [].concat(v).filter(x => typeof x === 'string');
+  return items.map(raw => {
+    const parts = raw.split(':');
+    if (parts.length < 2) return null;
+    let id = parts[0].trim(), label = parts[1].trim(), icon = 'compass', reposStr = '';
+    if (parts.length >= 4) { icon = parts[2].trim() || 'compass'; reposStr = parts.slice(3).join(':'); }
+    else if (parts.length === 3) { reposStr = parts[2]; }
+    const repos = reposStr.split(',').map(s => s.trim()).filter(Boolean);
+    return { id: slug(id), label: label || id, icon, repos: repos.length ? repos : [slug(id)] };
+  }).filter(Boolean);
+}
+function writeConfigFrom({ products, theme, accent, features }, base) {
+  const c = Object.assign(base || defaultConfig(), {});
+  if (products) c.products = products;
+  if (theme) c.theme = THEME_NAMES.includes(theme) ? theme : 'swiss';
+  if (accent) c.accent = accent;
+  if (features) c.features = features;
+  saveConfig(c);
+  return c;
+}
+function cmdInit(args) {
+  ensureDirs();
+  const hasFlags = args.theme || args.accent || args.features || args.product || args.yes || args.force;
+  if (hasFlags || !process.stdin.isTTY) {
+    // non-interactive
+    const products = args.product ? parseProductArg(args.product) : [];
+    let features = null;
+    if ('features' in args) { // present (even empty) => authoritative; empty means all off
+      const on = new Set(list(String(args.features === true ? '' : args.features).replace(/,/g, ';')));
+      features = { loops: on.has('loops'), seen: on.has('seen'), mirror: on.has('mirror') };
+    }
+    const base = fs.existsSync(CONFIG_PATH) && !args.force ? loadConfig() : defaultConfig();
+    const c = writeConfigFrom({
+      products: products.length ? products : (base.products.length ? base.products : undefined),
+      theme: args.theme,
+      accent: args.accent,
+      features,
+    }, base);
+    process.stdout.write(`wrote ${CONFIG_PATH}\n  theme=${c.theme} accent=${c.accent} products=${c.products.length} features=${Object.keys(c.features).filter(k => c.features[k]).join(',') || 'core-only'}\n`);
+    cmdRender({ quiet: true });
+    return;
+  }
+  // interactive wizard (readline, no deps)
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q, def) => new Promise(res => rl.question(def ? `${q} [${def}] ` : `${q} `, a => res((a || '').trim() || def || '')));
+  (async () => {
+    process.stdout.write('\nCommand Center · setup\n———————————————————————\n');
+    const products = [];
+    process.stdout.write('\nProducts group your repos into board tabs.\n');
+    for (;;) {
+      const id = await ask(`Product id (blank to finish, ${products.length} added):`, '');
+      if (!id) break;
+      const label = await ask('  Label:', id);
+      const repos = (await ask('  Repos (comma-separated):', id)).split(',').map(s => s.trim()).filter(Boolean);
+      const icon = await ask('  Icon (compass/box/cube/globe/terminal/cloud/page/spark):', 'compass');
+      products.push({ id: slug(id), label, icon: icon || 'compass', repos: repos.length ? repos : [slug(id)] });
+    }
+    const theme = (await ask(`\nTheme (${THEME_NAMES.join('/')}):`, 'swiss')).toLowerCase();
+    const accent = await ask('Accent color (hex):', DEFAULT_ACCENT);
+    const yn = (q, d) => ask(q + ' (y/n):', d).then(a => /^y/i.test(a));
+    const features = {
+      loops: await yn('Enable loops (async work shelf)?', 'y'),
+      seen: await yn('Enable read-relay (mark read / copy)?', 'y'),
+      mirror: await yn('Enable hosted mirror export?', 'n'),
+    };
+    rl.close();
+    const c = writeConfigFrom({ products, theme, accent, features }, defaultConfig());
+    process.stdout.write(`\nwrote ${CONFIG_PATH}\nRun \`ccmd demo\` to preview, or \`ccmd serve\` and open http://localhost:7777\n`);
+    cmdRender({ quiet: true });
+  })();
+}
+
+// ---------- demo (seed a realistic example store for screenshots/preview) ----------
+function cmdDemo(args) {
+  ensureDirs();
+  // demo resets the store — refuse to clobber real data unless --force or a fresh/demo store.
+  const existing = safeReaddir(DIRS.entries).flatMap(p => safeReaddir(path.join(DIRS.entries, p)));
+  const isDemoStore = (loadConfig().products || []).every(p => ['acme-web', 'acme-api', 'docs'].includes(p.id));
+  if (existing.length && !isDemoStore && !(args && args.force)) {
+    process.stdout.write(`ccmd demo resets the store, but ${HOME} already has data.\n` +
+      `  Re-run with --force to overwrite, or point ACC_HOME at a throwaway dir:\n` +
+      `  ACC_HOME=/tmp/acc-demo ccmd demo\n`);
+    return;
+  }
+  const base = fs.existsSync(CONFIG_PATH) ? loadConfig() : defaultConfig();
+  const demoProducts = [
+    { id: 'acme-web', label: 'Acme Web', icon: 'globe', repos: ['acme-web', 'acme-marketing'] },
+    { id: 'acme-api', label: 'Acme API', icon: 'terminal', repos: ['acme-api', 'acme-workers'] },
+    { id: 'docs', label: 'Docs', icon: 'page', repos: ['docs'] },
+  ];
+  const c = Object.assign(base, { products: demoProducts });
+  c.features = Object.assign({}, DEFAULT_FEATURES, { mirror: false }, base.features || {});
+  c.theme = c.theme || 'swiss';
+  c.accent = c.accent || DEFAULT_ACCENT;
+  saveConfig(c);
+  // clear prior demo data
+  for (const d of [DIRS.entries, DIRS.signals, DIRS.loops]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
+  ensureDirs();
+  const iso = (minsAgo) => new Date(Date.now() - minsAgo * 60000).toISOString();
+  const entry = (o) => writeJSON(path.join(DIRS.entries, o.project, slug(o.branch) + '.json'),
+    Object.assign({ key: `entry:${o.project}/${slug(o.branch)}`, done: [], inFlight: [], next: [], blockedOn: [] }, o));
+  entry({ project: 'acme-web', branch: 'feat/checkout-v2', status: 'IN_PROGRESS', agent: 'opus', tier: 'max',
+    summary: 'Rebuilding the checkout as a 3-step flow; address + payment done, review step wired, running the Stripe test suite now.',
+    task: 'PROJ-412 / PR #88', progress: '2/3 steps · CI green', inFlight: ['stripe test-mode e2e'], next: ['ship review step', 'copy pass'], updatedAt: iso(6) });
+  entry({ project: 'acme-web', branch: 'fix/hero-cls', status: 'DONE', agent: 'sonnet',
+    summary: 'Fixed the layout shift in the hero — reserved the image box, CLS down from 0.21 to 0.01. Ready to merge.',
+    task: 'PROJ-408 / PR #90', next: ['review + merge'], done: ['measured before/after', 'lighthouse pass'], updatedAt: iso(22) });
+  entry({ project: 'acme-api', branch: 'feat/rate-limit', status: 'BLOCKED', agent: 'opus', tier: 'max',
+    summary: 'Token-bucket rate limiter is built and tested, but I need the per-plan limits before wiring the paid tiers.',
+    task: 'PROJ-377 / PR #71', progress: 'core done · tiers pending', blockedOn: ['confirm limits: free 60/min, pro 600/min?'], updatedAt: iso(48) });
+  entry({ project: 'docs', branch: 'main', status: 'IN_PROGRESS', agent: 'haiku',
+    summary: 'Porting the API reference to the new docs site; 14 of 20 endpoints migrated with runnable examples.',
+    progress: '14/20 endpoints', inFlight: ['migrating /webhooks'], next: ['migrate remaining 6'], updatedAt: iso(90) });
+  const signal = (o) => { const id = o.id; writeJSON(path.join(DIRS.signals, id + '.json'), Object.assign({ key: `signal:${id}`, resolved: false }, o)); };
+  signal({ id: 'demo-q1', kind: 'question', project: 'acme-web', branch: 'feat/checkout-v2',
+    msg: 'Guest checkout for the review step: allow it, or force account creation before payment? Affects PROJ-412 — the review UI is built both ways behind a flag, I just need the call.', createdAt: iso(9) });
+  signal({ id: 'demo-b1', kind: 'blocker', project: 'acme-api', branch: 'feat/rate-limit',
+    msg: 'Need the per-plan rate limits to finish PROJ-377 (PR #71). Proposing free 60/min, pro 600/min — approve or give numbers and I ship the tiers.', createdAt: iso(47) });
+  const loop = (o) => writeJSON(path.join(DIRS.loops, slug(o.id).toLowerCase().slice(0, 48) + '.json'),
+    Object.assign({ links: [], createdAt: iso(120), updatedAt: iso(30) }, o));
+  loop({ id: 'migrate-tests-to-vitest', project: 'acme-web', title: 'Migrate the test suite from Jest to Vitest', status: 'ready', hours: '5',
+    summary: '~180 test files, mechanical but large: swap runner, fix config, update mocks, get CI green.', promptPath: 'loops/acme-web/vitest-migration.md', links: ['https://example.com/acme/issues/533'] });
+  loop({ id: 'audit-api-error-codes', project: 'acme-api', title: 'Audit and unify API error codes', status: 'waiting', hours: '4',
+    summary: 'Sweep every handler, map ad-hoc errors to the shared taxonomy, document each code.', prereqs: 'the error-taxonomy RFC has to merge first', promptPath: 'loops/acme-api/error-audit.md' });
+  loop({ id: 'docs-screenshot-refresh', project: 'docs', title: 'Refresh every screenshot in the docs', status: 'draft', hours: '3',
+    summary: 'Re-capture all product screenshots against the new UI, at 2x, and swap them in.', promptPath: 'loops/docs/screenshot-refresh.md' });
+  cmdRender({ quiet: true });
+  process.stdout.write(`seeded demo store at ${HOME}\n  4 entries · 2 signals · 3 loops · products: ${demoProducts.map(p => p.id).join(', ')}\n  run: ccmd serve   → http://localhost:7777\n`);
+}
+
+function cmdHelp() {
+  process.stdout.write(`ccmd — Command Center (machine-wide agent status board)
+  ccmd init [--theme swiss|terminal|soft] [--accent "#0a84ff"] [--features loops,seen,mirror] [--product "id:Label:repo1,repo2"]…
+                                                     # first-run setup; no flags + a TTY => wizard
+  ccmd demo                                          # seed a realistic example store (for preview/screenshots)
+  ccmd serve [--port 7777]                           # live local dashboard (marking read persists here)  ← default view
+  ccmd report --status IN_PROGRESS|BLOCKED|DONE --summary "…" [--task …] [--progress …] --done "a;b" --in-flight "…" --next "…" --blocked "…" [--agent name] [--tier max] [--note "…"]
+  ccmd signal --kind blocker|question --msg "…"      # prints an id; clear it with:
+  ccmd resolve <id>
+  ccmd loop --title "…" --summary "…" [--prompt-path f] [--links "u;u"] [--prereqs "…"] [--hours N] [--status ready|waiting|draft] [--project p]
+  ccmd loop --done <id>                              # curated async-work shelf (its own board tab)
+  ccmd render                                        # regenerate dashboard.html
+  ccmd prune [--presence]                            # archive DONE/read entries
+  ccmd seen <key> | ccmd unseen <key>                # key: entry:<project>/<branch> | signal:<id>
+  ccmd check [--since <epoch_ms>]                    # JSON {exists,fresh} for the cwd's entry (Stop hook)
+  ccmd mirror [--fragment] [--out file.html]         # optional hosted-mirror HTML export
+  ccmd set-url <url> | ccmd get-url                  # the hosted mirror URL
+  ccmd data                                          # JSON of the board model
+  Store: $ACC_HOME (default ~/.agents-command-center). project/branch auto-derive from git.
+  This is the only help (there is no per-command --help).
+`);
+}
+
+// ---------- dispatch ----------
+function main() {
+  const [, , cmd, ...rest] = process.argv;
+  const args = parseArgs(rest);
+  try {
+    switch (cmd) {
+      case 'init': return cmdInit(args);
+      case 'demo': return cmdDemo(args);
+      case 'report': return cmdReport(args);
+      case 'signal': return cmdSignal(args);
+      case 'resolve': return cmdResolve(args);
+      case 'render': return cmdRender(args);
+      case 'mirror': return cmdMirror(args);
+      case 'prune': return cmdPrune(args);
+      case 'seen': return cmdSeen(args);
+      case 'unseen': return cmdUnseen(args);
+      case 'check': return cmdCheck(args);
+      case 'set-url': return cmdSetUrl(args);
+      case 'get-url': return cmdGetUrl();
+      case 'loop': return cmdLoop(args);
+      case 'data': return cmdData();
+      case 'serve': return cmdServe(args);
+      case 'help': case '--help': case '-h': case undefined: return cmdHelp();
+      default: process.stdout.write(`unknown command: ${cmd}\n`); return cmdHelp();
+    }
+  } catch (e) {
+    // never blow up a hook
+    process.stderr.write(`ccmd: ${e && e.message ? e.message : e}\n`);
+  }
+}
+main();

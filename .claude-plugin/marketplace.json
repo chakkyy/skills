@@ -1,0 +1,21 @@
+{
+  "name": "command-center",
+  "owner": {
+    "name": "Command Center"
+  },
+  "metadata": {
+    "description": "A shared status board where every coding agent, across every project and session, reports what it's doing, what's blocked, and what needs you.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "command-center",
+      "description": "Run a fleet of coding agents like a team: agents report to one board, you see what's blocked and what needs you at a glance.",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/command-center"
+      ]
+    }
+  ]
+}
