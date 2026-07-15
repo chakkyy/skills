@@ -1,6 +1,6 @@
 ---
 name: command-center
-description: Report your status to the shared agent Command Center board. Use at the end of every turn/session (heartbeat), IMMEDIATELY when you hit a blocker or need the user's input, when you spot async-able work to shelve as a loop, and when the user pastes a "ccmd-read:" line. Works in any folder/project.
+description: Report your status to the shared agent Command Center board. Use at the end of every turn/session (heartbeat), IMMEDIATELY when you hit a blocker or need the user's input, when you spot async-able work to shelve as a goal (autonomous run), and when the user pastes a "ccmd-read:" line. Works in any folder/project.
 ---
 
 # Command Center
@@ -98,31 +98,37 @@ If a Stop hook is installed (see `hooks/`), this is enforced: a turn that change
 the repo without a fresh `report` is blocked once with instructions. Report and
 move on — it's one-shot, it won't loop.
 
-## Loops: curate async-able work (own tab)
+## Goals: curate async-able work (own tab)
 
-When you spot work that could run for **hours** without the user (a big
-integration, deep research, a massive refactor, burning down a backlog), don't
-leave it buried in a tracker — shelve it as a **loop** so the user can kick it
-off any time:
+When you spot work that could run for **hours** without the user toward a
+verifiable finish (a big integration, deep research, a massive refactor, burning
+down a backlog), don't leave it buried in a tracker — shelve it as a **goal** so
+the user can fire it off any time:
 
 ```
-ccmd loop --title "…" --summary "what it achieves, in one sellable sentence" \
+ccmd goal --title "…" --summary "what it achieves, in one sellable sentence" \
   --prompt-path <a .md file with the FULL paste-ready prompt> \
   --links "issue-url;doc-url" --prereqs "what must merge first" \
   --hours 6 --status ready --project <repo>
-ccmd loop --done <id>   # when it's completed
+ccmd goal --done <id>   # when it's completed
 ```
 
+**The pairing:** a shelved goal is a prompt with a completion condition — the
+user fires it with **Claude Code's `/goal`** (which runs until the goal is met),
+or `/loop` for the recurring-maintenance kind. That's why it's "goals", not
+"loops": the shelf is about *what done looks like*, not recurrence.
+
 Curation quality = referenced specs/docs, explicit budgets (API calls, tokens),
-the repo's branch rules, and end-to-end verification baked into the prompt. The
-tab groups loops by product: always pass `--project <repo>`. Use `--status
-draft` while curating, `waiting` if it's curated but a prereq is unmet (say which
-in `--prereqs`), and `ready` only when it can be pasted as-is.
+the repo's branch rules, an explicit completion condition, and end-to-end
+verification baked into the prompt. The tab groups goals by product: always pass
+`--project <repo>`. Use `--status draft` while curating, `waiting` if it's
+curated but a prereq is unmet (say which in `--prereqs`), and `ready` only when
+it can be fired as-is.
 
 **If the user is present in the session: ASK before shelving.** When you spot
 async-able work, tell them ("this can run for ~N hours on its own") and offer both
-exits: run it now, or shelve it as a loop. Only shelve without asking when you're
-running unattended (a loop/overnight run) or when they already asked.
+exits: run it now, or shelve it as a goal. Only shelve without asking when you're
+running unattended (an overnight run) or when they already asked.
 
 ## Processing a pasted `ccmd-read:` line (read relay)
 
@@ -166,10 +172,10 @@ If `$ACC_HOME/config.json` is missing, set it up before the first report:
   wizard's questions and run the non-interactive form:
   ```
   ccmd init --theme swiss|terminal|soft --accent "#0a84ff" \
-    --features loops,seen --product "web:Web:globe:app,marketing" --product "api:API:terminal:api"
+    --features goals,seen --product "web:Web:globe:app,marketing" --product "api:API:terminal:api"
   ```
   Ask: which products group which repos, theme, accent, and which features to
-  enable (`loops`, `seen`; `mirror` is off by default). `--product` is
+  enable (`goals`, `seen`; `mirror` is off by default). `--product` is
   `id:Label[:icon]:repo1,repo2` and repeatable.
 - **Solo/unattended:** run `ccmd init` with sensible defaults, or `ccmd demo` to
   preview against an example store.

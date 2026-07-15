@@ -34,7 +34,7 @@ ccmd demo                # seed a realistic example store (for preview/screensho
 |------|---------|
 | `--theme swiss\|terminal\|soft` | Board theme (default `swiss`). |
 | `--accent "#0a84ff"` | Accent color (hex). |
-| `--features loops,seen,mirror` | Enable these; others off. `stats` and core are always on. |
+| `--features goals,seen,mirror` | Enable these; others off. `stats` and core are always on. The old `loops` token is accepted as an alias for `goals`. |
 | `--product "id:Label:repo1,repo2"` | A product = a tab grouping repos. Repeatable. |
 | `--product "id:Label:icon:repo1,repo2"` | Optional icon (compass, globe, terminal, page, box, cube, cloud, spark, layers, database, bot). |
 | `--force` | Overwrite an existing config instead of merging. |
@@ -64,16 +64,22 @@ ccmd resolve <id>                                             # clear it
 Signals persist, highlighted, until resolved. One self-contained signal per
 pending decision. Put it on the tab of the product it's about (`--project`).
 
-## Loops (async-work shelf)
+## Goals (async-work shelf)
 
 ```
-ccmd loop --title "…" --summary "…" [--prompt-path f.md] [--links "u;u"] \
+ccmd goal --title "…" --summary "…" [--prompt-path f.md] [--links "u;u"] \
   [--prereqs "…"] [--hours N] [--status ready|waiting|draft] [--project p] [--id slug]
-ccmd loop --done <id>
+ccmd goal --done <id>
 ```
 
 `draft` = still curating · `waiting` = curated but a prereq is unmet · `ready` =
-paste-and-go. Grouped by product on the Loops tab. (Requires `features.loops`.)
+fire-and-go. Grouped by product on the Goals tab. (Requires `features.goals`.) A
+shelved goal pairs with Claude Code's `/goal` — you fire it and it runs until the
+completion condition is met.
+
+> **Renamed from "loops".** `ccmd loop …` still works (prints a deprecation
+> notice), a `features.loops` key in `config.json` is honored as `goals`, and an
+> existing `loops/` store dir is migrated to `goals/` on first run.
 
 ## Read tracking
 
@@ -115,7 +121,7 @@ that supplies its own).
   ],
   "theme": "swiss",              // swiss | terminal | soft
   "accent": "#0a84ff",           // any hex
-  "features": { "loops": true, "seen": true, "mirror": false },
+  "features": { "goals": true, "seen": true, "mirror": false },
   "mirrorUrl": null,
   "staleMs": 21600000            // rows with no update past this go grey (6h default)
 }

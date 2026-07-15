@@ -27,17 +27,22 @@ const DIRS = {
   signals: path.join(HOME, 'signals'),
   seen: path.join(HOME, 'seen'),
   archive: path.join(HOME, 'archive'),
-  loops: path.join(HOME, 'loops'),
+  goals: path.join(HOME, 'goals'),
 };
 const CONFIG_PATH = path.join(HOME, 'config.json');
 const DASHBOARD_PATH = path.join(HOME, 'dashboard.html');
 
 const STALE_MS = 6 * 60 * 60 * 1000; // 6h without update => greyed
 const DEFAULT_ACCENT = '#0a84ff';
-const DEFAULT_FEATURES = { loops: true, seen: true, mirror: false };
+const DEFAULT_FEATURES = { goals: true, seen: true, mirror: false };
 
 // ---------- tiny utils ----------
 function ensureDirs() {
+  // one-time migration: the "loops" feature was renamed to "goals".
+  try {
+    const oldDir = path.join(HOME, 'loops'), newDir = path.join(HOME, 'goals');
+    if (fs.existsSync(oldDir) && !fs.existsSync(newDir)) fs.renameSync(oldDir, newDir);
+  } catch {}
   for (const d of Object.values(DIRS)) fs.mkdirSync(d, { recursive: true });
 }
 function readJSON(p, fallback) {
@@ -64,7 +69,11 @@ function defaultConfig() {
 }
 function loadConfig() {
   const c = Object.assign(defaultConfig(), readJSON(CONFIG_PATH, {}));
-  c.features = Object.assign({}, DEFAULT_FEATURES, c.features || {});
+  const f = c.features || {};
+  // back-compat: the "loops" toggle was renamed to "goals". Honor the old key.
+  if (f.goals === undefined && f.loops !== undefined) f.goals = f.loops;
+  c.features = Object.assign({}, DEFAULT_FEATURES, f);
+  delete c.features.loops;
   if (!Array.isArray(c.products)) c.products = [];
   return c;
 }
@@ -174,34 +183,35 @@ function cmdResolve(args) {
   process.stdout.write(`resolved ${id}\n`);
 }
 
-// ---------- loops: curated async work, ready to be run unattended ----------
-// A "loop" is a chunk of agentic work that can run for hours without you.
-// Agents curate the full prompt + specs/links and shelve it here (grouped by
-// product) so you can kick one off any time. (Toggle: features.loops)
-function cmdLoop(args) {
-  if (!feat('loops')) { process.stdout.write('loops feature is off (set features.loops=true in config.json)\n'); return; }
+// ---------- goals: curated async work with a verifiable end state ----------
+// A "goal" is a chunk of agentic work that can run for hours without you until a
+// completion condition is met. Agents curate the full prompt + specs/links and
+// shelve it here (grouped by product) so you can fire one off with Claude Code's
+// /goal any time. (Toggle: features.goals)
+function cmdGoal(args) {
+  if (!feat('goals')) { process.stdout.write('goals feature is off (set features.goals=true in config.json)\n'); return; }
   ensureDirs();
-  fs.mkdirSync(DIRS.loops, { recursive: true });
-  if (args._[0] === 'add') args._.shift(); // `ccmd loop add …` sugar == `ccmd loop …`
+  fs.mkdirSync(DIRS.goals, { recursive: true });
+  if (args._[0] === 'add') args._.shift(); // `ccmd goal add …` sugar == `ccmd goal …`
   if (args.done) {
-    const p = path.join(DIRS.loops, slug(String(args.done)).toLowerCase().slice(0, 48) + '.json');
+    const p = path.join(DIRS.goals, slug(String(args.done)).toLowerCase().slice(0, 48) + '.json');
     const it = readJSON(p, null);
-    if (!it) { process.stdout.write(`no such loop: ${args.done}\n`); return; }
+    if (!it) { process.stdout.write(`no such goal: ${args.done}\n`); return; }
     it.status = 'done'; it.updatedAt = new Date().toISOString();
-    writeJSON(path.join(DIRS.archive, 'loop-' + it.id + '.json'), it);
+    writeJSON(path.join(DIRS.archive, 'goal-' + it.id + '.json'), it);
     try { fs.unlinkSync(p); } catch {}
-    process.stdout.write(`loop done ${it.id}\n`); return;
+    process.stdout.write(`goal done ${it.id}\n`); return;
   }
   const idForTitle = args.id ? slug(String(args.id)).toLowerCase().slice(0, 48) : null;
-  const prevForTitle = idForTitle ? readJSON(path.join(DIRS.loops, idForTitle + '.json'), {}) : {};
+  const prevForTitle = idForTitle ? readJSON(path.join(DIRS.goals, idForTitle + '.json'), {}) : {};
   const title = args.title || args._[0] || prevForTitle.title;
   if (!title) {
-    process.stdout.write('usage: ccmd loop --title "…" --summary "…" [--prompt-path <file>] [--links "url;url"] [--prereqs "…"] [--hours N] [--status ready|waiting|draft] [--project p] [--id slug] | ccmd loop --done <id>\n');
+    process.stdout.write('usage: ccmd goal --title "…" --summary "…" [--prompt-path <file>] [--links "url;url"] [--prereqs "…"] [--hours N] [--status ready|waiting|draft] [--project p] [--id slug] | ccmd goal --done <id>\n');
     return;
   }
   const { project } = context(args);
   const id = slug(String(args.id || title)).toLowerCase().slice(0, 48);
-  const p = path.join(DIRS.loops, id + '.json');
+  const p = path.join(DIRS.goals, id + '.json');
   const prev = readJSON(p, {});
   const status = String(args.status || prev.status || 'draft').toLowerCase();
   // waiting = curated & complete but a prereq is unmet (neither ready nor draft).
@@ -219,7 +229,7 @@ function cmdLoop(args) {
     updatedAt: new Date().toISOString(),
   });
   writeJSON(p, item);
-  process.stdout.write(`loop ${item.id} [${item.status}]\n`);
+  process.stdout.write(`goal ${item.id} [${item.status}]\n`);
 }
 
 function cmdSeen(args) { const k = args._[0]; if (k) { markSeen(k); process.stdout.write(`seen ${k}\n`); } }
@@ -411,15 +421,15 @@ function boardModel() {
     { v: visEntries.filter(e => e.status === 'DONE').length, l: 'ready to review' },
   ];
 
-  const LOOP_RANK = { ready: 0, waiting: 1, draft: 2 };
-  const loops = feat('loops') ? safeReaddir(DIRS.loops)
+  const GOAL_RANK = { ready: 0, waiting: 1, draft: 2 };
+  const goals = feat('goals') ? safeReaddir(DIRS.goals)
     .filter(f => f.endsWith('.json'))
-    .map(f => readJSON(path.join(DIRS.loops, f), null))
+    .map(f => readJSON(path.join(DIRS.goals, f), null))
     .filter(Boolean)
     .filter(n => n.status !== 'done')
-    .sort((a, b) => ((LOOP_RANK[a.status] ?? 9) - (LOOP_RANK[b.status] ?? 9)) || (a.updatedAt < b.updatedAt ? 1 : -1)) : [];
+    .sort((a, b) => ((GOAL_RANK[a.status] ?? 9) - (GOAL_RANK[b.status] ?? 9)) || (a.updatedAt < b.updatedAt ? 1 : -1)) : [];
 
-  return { products: grouped, entries: visEntries, signals: visSignals, prio, stats, staleMs, now, loops, cfg };
+  return { products: grouped, entries: visEntries, signals: visSignals, prio, stats, staleMs, now, goals, cfg };
 }
 
 // ---------- rendering ----------
@@ -487,14 +497,14 @@ function buildHTML({ interactive, fragment }) {
   const { ICON, STEP, UI } = icons();
   const iconFor = (name) => ICON[name] || ICON.compass || '';
   const m = boardModel();
-  const showLoops = feat('loops');
+  const showGoals = feat('goals');
   const showAck = feat('seen');
   const hasData = m.entries.length || m.signals.length;
 
   // --- tabs
   const tabDefs = [{ id: 'overview', label: 'Overview' }]
     .concat(m.products.map(p => ({ id: p.id, label: p.label })));
-  if (showLoops) tabDefs.push({ id: 'loops', label: `Loops${m.loops.length ? ` · ${m.loops.filter(n => n.status === 'ready').length}` : ''}` });
+  if (showGoals) tabDefs.push({ id: 'goals', label: `Goals${m.goals.length ? ` · ${m.goals.filter(n => n.status === 'ready').length}` : ''}` });
   tabDefs.push({ id: 'command-center', label: 'Command Center' });
   const segHTML = tabDefs.map((t, i) =>
     `<button role="tab" data-tab="${esc(t.id)}" aria-selected="${i === 0}">${esc(t.label)}</button>`).join('');
@@ -540,16 +550,16 @@ function buildHTML({ interactive, fragment }) {
     </div>`;
   }).join('');
 
-  // --- panel: loops (curated async work backlog)
-  let loopsHTML = '';
-  if (showLoops) {
-    const LOOP_UI = {
+  // --- panel: goals (curated async work with a verifiable end state)
+  let goalsHTML = '';
+  if (showGoals) {
+    const GOAL_UI = {
       ready: ['ready', 'Ready to run'],
       waiting: ['idle', 'Waiting on prereq'],
       draft: ['doing', 'Drafting'],
     };
-    const loopCard = (n, prod) => {
-      const ui = LOOP_UI[n.status] || LOOP_UI.draft;
+    const goalCard = (n, prod) => {
+      const ui = GOAL_UI[n.status] || GOAL_UI.draft;
       const metaBits = [n.hours ? `~${esc(String(n.hours))} h` : null, timeAgo(n.updatedAt)].filter(Boolean).join(' · ');
       const links = (n.links || []).map(u => linkify(esc(u))).join(' · ');
       return `<article class="card">
@@ -562,27 +572,27 @@ function buildHTML({ interactive, fragment }) {
       ${n.prereqs ? `<div class="youmove"><div class="lbl">Before running</div><div class="txt">${esc(n.prereqs)}</div></div>` : ''}
       ${n.promptPath ? `<div class="nprompt"><span class="lbl">Prompt</span><code class="k">${esc(n.promptPath)}</code></div>` : ''}
       ${links ? `<div class="cfoot">${links}</div>` : ''}
-      <div class="cfoot" style="opacity:.75">paste the prompt into an agent session and walk away · when it's done: <code class="k">ccmd loop --done ${esc(n.id)}</code></div>
+      <div class="cfoot" style="opacity:.75">fire it with Claude Code's <code class="k">/goal</code> and walk away · when it's done: <code class="k">ccmd goal --done ${esc(n.id)}</code></div>
     </article>`;
     };
-    const loopGroups = [];
-    for (const n of m.loops) {
+    const goalGroups = [];
+    for (const n of m.goals) {
       const prod = productFor(n.project);
-      let g = loopGroups.find(x => x.prod.id === prod.id);
-      if (!g) { g = { prod, items: [] }; loopGroups.push(g); }
+      let g = goalGroups.find(x => x.prod.id === prod.id);
+      if (!g) { g = { prod, items: [] }; goalGroups.push(g); }
       g.items.push(n);
     }
-    loopGroups.sort((a, b) => productOrder(a.prod.id) - productOrder(b.prod.id));
-    const loopCards = loopGroups.map((g, gi) => {
+    goalGroups.sort((a, b) => productOrder(a.prod.id) - productOrder(b.prod.id));
+    const goalCards = goalGroups.map((g, gi) => {
       const ready = g.items.filter(n => n.status === 'ready').length;
-      const head = `<p class="kick" style="margin:${gi === 0 ? '0' : '30px'} 0 12px">${esc(g.prod.label)} · ${g.items.length} loop${g.items.length === 1 ? '' : 's'}${ready ? ` · ${ready} ready` : ''}</p>`;
-      return head + `<div class="stack">${g.items.map(n => loopCard(n, g.prod)).join('')}</div>`;
+      const head = `<p class="kick" style="margin:${gi === 0 ? '0' : '30px'} 0 12px">${esc(g.prod.label)} · ${g.items.length} goal${g.items.length === 1 ? '' : 's'}${ready ? ` · ${ready} ready` : ''}</p>`;
+      return head + `<div class="stack">${g.items.map(n => goalCard(n, g.prod)).join('')}</div>`;
     }).join('');
-    loopsHTML = `<div class="panel" role="tabpanel" data-tab="loops" hidden>
-      <p class="kick">Loops · curated async work, ready to pull down</p>
+    goalsHTML = `<div class="panel" role="tabpanel" data-tab="goals" hidden>
+      <p class="kick">Goals · curated async work with a finish line</p>
       <h2>Work that runs while you sleep.</h2>
-      <p class="sub">Agents spot the work that can run for hours without you, curate the full prompt with specs and links, and shelve it here. You pick one any night, paste the prompt, and go — your live hours stay for the synchronous work.</p>
-      ${m.loops.length ? loopCards : `<div class="void"><p class="vt">No loops on the shelf</p><p class="vs">When an agent finds async-able work it leaves it here with <code>ccmd loop</code>.</p></div>`}
+      <p class="sub">Agents spot the work that can run for hours without you, curate the full prompt with specs, links and a completion condition, and shelve it here. You pick one any night, fire it with Claude Code's <code>/goal</code>, and go — your live hours stay for the synchronous work.</p>
+      ${m.goals.length ? goalCards : `<div class="void"><p class="vt">No goals on the shelf</p><p class="vs">When an agent finds async-able work it leaves it here with <code>ccmd goal</code>.</p></div>`}
     </div>`;
   }
 
@@ -599,7 +609,7 @@ function buildHTML({ interactive, fragment }) {
       'Overview = triage: one line per item and per-product counts; the full detail lives in each product tab, and every Overview card jumps to it.',
       'Cards come straight from <code>ccmd report</code> / <code>ccmd signal</code>, with the real store keys.',
       'Three themes (swiss / terminal / soft) + a custom accent, injected as CSS variables at render time.',
-      'Feature toggles (loops / read-relay / mirror) turn tabs, commands and board sections on and off.',
+      'Feature toggles (goals / read-relay / mirror) turn tabs, commands and board sections on and off.',
     ] },
     { ver: 'why', t: 'We moved to local-first', d: 'This started life publishing an HTML mirror to a hosted artifact every turn. That was pure overhead — re-uploading the whole board on every report. The live <code>ccmd serve</code> at localhost is now the default; the mirror survives only as an optional adapter for teams that want a shared URL.', bullets: [] },
   ];
@@ -637,7 +647,7 @@ function buildHTML({ interactive, fragment }) {
     <p class="updated">${esc(updated)}</p>
   </header>
   <div class="segwrap"><div class="seg" role="tablist" aria-label="Sections" id="seg">${segHTML}</div></div>
-  <main id="panels">${overviewHTML}${prodPanels}${loopsHTML}${commandCenterHTML}</main>
+  <main id="panels">${overviewHTML}${prodPanels}${goalsHTML}${commandCenterHTML}</main>
   <footer><span>Command Center · generated by ccmd</span><span>${showAck ? 'mark read and "Copy what I read" to clear items' : 'open-source agent status board'}</span></footer>
 </div>${relayBlock}`;
 
@@ -750,7 +760,7 @@ function cmdInit(args) {
     let features = null;
     if ('features' in args) { // present (even empty) => authoritative; empty means all off
       const on = new Set(list(String(args.features === true ? '' : args.features).replace(/,/g, ';')));
-      features = { loops: on.has('loops'), seen: on.has('seen'), mirror: on.has('mirror') };
+      features = { goals: on.has('goals') || on.has('loops'), seen: on.has('seen'), mirror: on.has('mirror') };
     }
     const base = fs.existsSync(CONFIG_PATH) && !args.force ? loadConfig() : defaultConfig();
     const c = writeConfigFrom({
@@ -782,7 +792,7 @@ function cmdInit(args) {
     const accent = await ask('Accent color (hex):', DEFAULT_ACCENT);
     const yn = (q, d) => ask(q + ' (y/n):', d).then(a => /^y/i.test(a));
     const features = {
-      loops: await yn('Enable loops (async work shelf)?', 'y'),
+      goals: await yn('Enable goals (async work shelf)?', 'y'),
       seen: await yn('Enable read-relay (mark read / copy)?', 'y'),
       mirror: await yn('Enable hosted mirror export?', 'n'),
     };
@@ -817,7 +827,7 @@ function cmdDemo(args) {
   c.accent = c.accent || DEFAULT_ACCENT;
   saveConfig(c);
   // clear prior demo data
-  for (const d of [DIRS.entries, DIRS.signals, DIRS.loops]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
+  for (const d of [DIRS.entries, DIRS.signals, DIRS.goals]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
   ensureDirs();
   const iso = (minsAgo) => new Date(Date.now() - minsAgo * 60000).toISOString();
   const entry = (o) => writeJSON(path.join(DIRS.entries, o.project, slug(o.branch) + '.json'),
@@ -839,16 +849,16 @@ function cmdDemo(args) {
     msg: 'Guest checkout for the review step: allow it, or force account creation before payment? Affects PROJ-412 — the review UI is built both ways behind a flag, I just need the call.', createdAt: iso(9) });
   signal({ id: 'demo-b1', kind: 'blocker', project: 'acme-api', branch: 'feat/rate-limit',
     msg: 'Need the per-plan rate limits to finish PROJ-377 (PR #71). Proposing free 60/min, pro 600/min — approve or give numbers and I ship the tiers.', createdAt: iso(47) });
-  const loop = (o) => writeJSON(path.join(DIRS.loops, slug(o.id).toLowerCase().slice(0, 48) + '.json'),
+  const goal = (o) => writeJSON(path.join(DIRS.goals, slug(o.id).toLowerCase().slice(0, 48) + '.json'),
     Object.assign({ links: [], createdAt: iso(120), updatedAt: iso(30) }, o));
-  loop({ id: 'migrate-tests-to-vitest', project: 'acme-web', title: 'Migrate the test suite from Jest to Vitest', status: 'ready', hours: '5',
-    summary: '~180 test files, mechanical but large: swap runner, fix config, update mocks, get CI green.', promptPath: 'loops/acme-web/vitest-migration.md', links: ['https://example.com/acme/issues/533'] });
-  loop({ id: 'audit-api-error-codes', project: 'acme-api', title: 'Audit and unify API error codes', status: 'waiting', hours: '4',
-    summary: 'Sweep every handler, map ad-hoc errors to the shared taxonomy, document each code.', prereqs: 'the error-taxonomy RFC has to merge first', promptPath: 'loops/acme-api/error-audit.md' });
-  loop({ id: 'docs-screenshot-refresh', project: 'docs', title: 'Refresh every screenshot in the docs', status: 'draft', hours: '3',
-    summary: 'Re-capture all product screenshots against the new UI, at 2x, and swap them in.', promptPath: 'loops/docs/screenshot-refresh.md' });
+  goal({ id: 'migrate-tests-to-vitest', project: 'acme-web', title: 'Migrate the test suite from Jest to Vitest', status: 'ready', hours: '5',
+    summary: '~180 test files, mechanical but large: swap runner, fix config, update mocks, get CI green.', promptPath: 'goals/acme-web/vitest-migration.md', links: ['https://example.com/acme/issues/533'] });
+  goal({ id: 'audit-api-error-codes', project: 'acme-api', title: 'Audit and unify API error codes', status: 'waiting', hours: '4',
+    summary: 'Sweep every handler, map ad-hoc errors to the shared taxonomy, document each code.', prereqs: 'the error-taxonomy RFC has to merge first', promptPath: 'goals/acme-api/error-audit.md' });
+  goal({ id: 'docs-screenshot-refresh', project: 'docs', title: 'Refresh every screenshot in the docs', status: 'draft', hours: '3',
+    summary: 'Re-capture all product screenshots against the new UI, at 2x, and swap them in.', promptPath: 'goals/docs/screenshot-refresh.md' });
   cmdRender({ quiet: true });
-  process.stdout.write(`seeded demo store at ${HOME}\n  4 entries · 2 signals · 3 loops · products: ${demoProducts.map(p => p.id).join(', ')}\n  run: ccmd serve   → http://localhost:7777\n`);
+  process.stdout.write(`seeded demo store at ${HOME}\n  4 entries · 2 signals · 3 goals · products: ${demoProducts.map(p => p.id).join(', ')}\n  run: ccmd serve   → http://localhost:7777\n`);
 }
 
 // ---------- link (make `ccmd` a real command on PATH) ----------
@@ -879,15 +889,15 @@ function cmdHelp() {
   absolute path, or run 'ccmd link' once to expose it as a real 'ccmd' command.
   ccmd link [--dir <bin>]                            # symlink this binary onto PATH (~/.local/bin)
   ccmd where                                         # print this binary's absolute path
-  ccmd init [--theme swiss|terminal|soft] [--accent "#0a84ff"] [--features loops,seen,mirror] [--product "id:Label:repo1,repo2"]…
+  ccmd init [--theme swiss|terminal|soft] [--accent "#0a84ff"] [--features goals,seen,mirror] [--product "id:Label:repo1,repo2"]…
                                                      # first-run setup; no flags + a TTY => wizard
   ccmd demo                                          # seed a realistic example store (for preview/screenshots)
   ccmd serve [--port 7777]                           # live local dashboard (marking read persists here)  ← default view
   ccmd report --status IN_PROGRESS|BLOCKED|DONE --summary "…" [--task …] [--progress …] --done "a;b" --in-flight "…" --next "…" --blocked "…" [--agent name] [--tier max] [--note "…"]
   ccmd signal --kind blocker|question --msg "…"      # prints an id; clear it with:
   ccmd resolve <id>
-  ccmd loop --title "…" --summary "…" [--prompt-path f] [--links "u;u"] [--prereqs "…"] [--hours N] [--status ready|waiting|draft] [--project p]
-  ccmd loop --done <id>                              # curated async-work shelf (its own board tab)
+  ccmd goal --title "…" --summary "…" [--prompt-path f] [--links "u;u"] [--prereqs "…"] [--hours N] [--status ready|waiting|draft] [--project p]
+  ccmd goal --done <id>                              # curated async-work shelf (pairs with Claude Code's /goal)
   ccmd render                                        # regenerate dashboard.html
   ccmd prune [--presence]                            # archive DONE/read entries
   ccmd seen <key> | ccmd unseen <key>                # key: entry:<project>/<branch> | signal:<id>
@@ -921,7 +931,10 @@ function main() {
       case 'check': return cmdCheck(args);
       case 'set-url': return cmdSetUrl(args);
       case 'get-url': return cmdGetUrl();
-      case 'loop': return cmdLoop(args);
+      case 'goal': return cmdGoal(args);
+      case 'loop': // deprecated alias — the feature was renamed to "goals"
+        process.stderr.write("ccmd: 'loop' was renamed to 'goal' — use 'ccmd goal'. (running it for you)\n");
+        return cmdGoal(args);
       case 'data': return cmdData();
       case 'serve': return cmdServe(args);
       case 'help': case '--help': case '-h': case undefined: return cmdHelp();

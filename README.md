@@ -75,19 +75,24 @@ The **Overview** is deliberately a triage screen: one line per pending item, eac
 jumping to the product tab that holds the full detail. Blockers and questions
 stay pinned, highlighted, until an agent resolves them.
 
-## Loops — work that runs while you sleep
+## Goals — work that runs while you sleep
 
-Some work can run for *hours* without you: a big migration, a deep refactor, a
-backlog burn-down. Instead of losing it in a tracker, an agent curates the full
-paste-ready prompt and shelves it as a **loop**. You pick one any night, paste
-it, and go.
+Some work can run for *hours* without you toward a clear finish: a big migration,
+a deep refactor, a backlog burn-down. Instead of losing it in a tracker, an agent
+curates the full paste-ready prompt (with a completion condition) and shelves it
+as a **goal**. You pick one any night and fire it with Claude Code's
+[`/goal`](https://code.claude.com/docs/en/goal) — it runs until the goal is met.
 
-![The Loops shelf in the soft theme](examples/loops.png)
+![The Goals shelf in the soft theme](examples/goals.png)
 
 ```bash
-ccmd loop --title "Migrate the test suite to Vitest" --hours 5 --status ready \
-  --prompt-path loops/web/vitest-migration.md --project web
+ccmd goal --title "Migrate the test suite to Vitest" --hours 5 --status ready \
+  --prompt-path goals/web/vitest-migration.md --project web
 ```
+
+> Renamed from "loops" — the shelf is about *what done looks like*, so it pairs
+> with `/goal` (completion) rather than `/loop` (recurrence). `ccmd loop` still
+> works as a deprecated alias.
 
 ## Themes
 
