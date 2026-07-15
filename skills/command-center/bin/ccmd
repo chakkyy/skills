@@ -102,8 +102,9 @@ function clearSeen(key) { try { fs.unlinkSync(keyToFile(key)); } catch {} }
 // so /seen and the `ccmd-read:` relay can never mint or traverse to arbitrary files.
 const SEG = '[A-Za-z0-9._@-]{1,120}';
 const KEY_RE = new RegExp(`^(?:entry:${SEG}/${SEG}|signal:${SEG})$`);
+function validKeyFormat(key) { return typeof key === 'string' && key.length <= 260 && KEY_RE.test(key); }
 function validKey(key) {
-  if (typeof key !== 'string' || key.length > 260 || !KEY_RE.test(key)) return false;
+  if (!validKeyFormat(key)) return false;
   if (key.startsWith('entry:')) {
     const rest = key.slice(6);
     const i = rest.indexOf('/');
@@ -269,8 +270,13 @@ function cmdGoal(args) {
   process.stdout.write(`goal ${item.id} [${item.status}]\n`);
 }
 
-function cmdSeen(args) { const k = args._[0]; if (k) { markSeen(k); process.stdout.write(`seen ${k}\n`); } }
-function cmdUnseen(args) { const k = args._[0]; if (k) { clearSeen(k); process.stdout.write(`unseen ${k}\n`); } }
+function seenOff() {
+  if (feat('seen')) return false;
+  process.stdout.write('read-relay (seen) feature is off (set features.seen=true in config.json)\n');
+  process.exitCode = 1; return true;
+}
+function cmdSeen(args) { if (seenOff()) return; const k = args._[0]; if (!k || !validKeyFormat(k)) { process.stdout.write('usage: ccmd seen <entry:project/branch|signal:id>\n'); process.exitCode = 1; return; } markSeen(k); process.stdout.write(`seen ${k}\n`); }
+function cmdUnseen(args) { if (seenOff()) return; const k = args._[0]; if (!k || !validKeyFormat(k)) { process.stdout.write('usage: ccmd unseen <entry:project/branch|signal:id>\n'); process.exitCode = 1; return; } clearSeen(k); process.stdout.write(`unseen ${k}\n`); }
 
 function cmdSetUrl(args) {
   const url = args._[0] || args.url;
@@ -317,9 +323,11 @@ function collect() {
 
 function cmdPrune(args) {
   const { entries } = collect();
+  const seenOn = feat('seen');
   let archived = 0;
   for (const e of entries) {
-    if (e.status === 'DONE' || e.seen) {
+    // With the read-relay feature off, "seen" has no meaning — only DONE is archived.
+    if (e.status === 'DONE' || (seenOn && e.seen)) {
       const src = path.join(DIRS.entries, e.project, slug(e.branch) + '.json');
       writeJSON(path.join(DIRS.archive, `entry-${e.project}-${slug(e.branch)}-${Date.now()}.json`), e);
       try { fs.unlinkSync(src); } catch {}
@@ -393,11 +401,17 @@ function boardModel() {
   const cfg = loadConfig();
   const staleMs = cfg.staleMs || STALE_MS;
   const now = Date.now();
-  const visEntries = entries.filter(e => !e.seen)
+  const seenOn = feat('seen');
+  // Entries: a read report drops off the board (only when the feature is on).
+  const visEntries = entries.filter(e => seenOn ? !e.seen : true)
     .map(e => Object.assign({}, e, { ui: uiStatus(e, staleMs, now) }))
     .sort((a, b) => (CLS_RANK[a.ui.cls] - CLS_RANK[b.ui.cls]) || (a.updatedAt < b.updatedAt ? 1 : -1));
-  const visSignals = signals.filter(s => !s.seen)
-    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  // Signals leave the board only when RESOLVED. "read" just dims them and drops
+  // them from the urgency surfaces — an unresolved blocker/question stays visible.
+  const allSignals = signals.slice().sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  const isUrgent = (s) => !(seenOn && s.seen);
+  const visSignals = allSignals;                 // shown in product tabs (read = dimmed)
+  const urgentSignals = allSignals.filter(isUrgent); // drive prio + counts + "needs you"
 
   const groups = new Map();
   const groupFor = (proj) => {
@@ -412,13 +426,15 @@ function boardModel() {
   for (const g of grouped) {
     const present = new Set(g.entries.map(e => e.project).concat(g.signals.map(s => s.project)));
     g.reposLine = Array.from(present).join(' · ');
-    const worst = g.signals.length || g.entries.some(e => e.ui.cls === 'need') ? ['need', 'Needs you']
+    const gUrgent = g.signals.filter(isUrgent);
+    const worst = gUrgent.length || g.entries.some(e => e.ui.cls === 'need') ? ['need', 'Needs you']
       : g.entries.some(e => e.ui.cls === 'doing') ? ['doing', 'In progress']
       : g.entries.some(e => e.ui.cls === 'ready') ? ['ready', 'Ready']
+      : g.signals.length ? ['idle', 'Acknowledged'] // read-but-unresolved
       : ['idle', 'No signal'];
     g.summaryStatus = worst;
     const latest = g.entries.slice().sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1))[0];
-    g.summaryLine = (g.signals[0] && g.signals[0].msg) || (latest && latest.summary) || '';
+    g.summaryLine = (gUrgent[0] && gUrgent[0].msg) || (g.signals[0] && g.signals[0].msg) || (latest && latest.summary) || '';
     const q = g.signals.filter(s => s.kind === 'question').length;
     const bl = g.signals.length - q;
     const doing = g.entries.filter(e => e.ui.cls === 'doing').length;
@@ -433,8 +449,9 @@ function boardModel() {
   grouped.sort((a, b) => (CLS_RANK[a.summaryStatus[0]] - CLS_RANK[b.summaryStatus[0]]) || a.label.localeCompare(b.label));
 
   // Overview priorities: ONE line per item (brief) + jump to the product tab for detail.
+  // Only URGENT (unread) signals nag you here; acknowledged-but-unresolved ones live in their tab.
   const prio = [];
-  for (const s of visSignals) {
+  for (const s of urgentSignals) {
     prio.push({
       t: brief(s.msg),
       d: `<code>${esc(productFor(s.project).label)}</code> · ${s.kind === 'question' ? 'question' : 'blocker'} · ${timeAgo(s.createdAt)} · detail in its tab`,
@@ -454,7 +471,7 @@ function boardModel() {
   const stats = [
     { v: grouped.length, l: 'products reporting' },
     { v: visEntries.filter(e => e.ui.cls === 'doing').length, l: 'fronts in progress' },
-    { v: visSignals.length + visEntries.filter(e => e.ui.cls === 'need').length, l: 'need your eyes' },
+    { v: urgentSignals.length + visEntries.filter(e => e.ui.cls === 'need').length, l: 'need your eyes' },
     { v: visEntries.filter(e => e.status === 'DONE').length, l: 'ready to review' },
   ];
 
@@ -511,15 +528,18 @@ function entryCard(e, prodIcon, showAck) {
 
 function signalCard(s, prodIcon, showAck) {
   const { UI } = icons();
-  return `<article class="card" data-ack="${esc(s.key)}">
+  // Read but unresolved → dimmed + "Acknowledged"; it only leaves on `ccmd resolve`.
+  const ack = showAck && s.seen;
+  const status = ack ? ['idle', 'Acknowledged'] : ['need', 'Needs you'];
+  return `<article class="card${ack ? ' read' : ''}" data-ack="${esc(s.key)}">
     <div class="chead">
       <span class="pic">${prodIcon}</span>
       <div style="min-width:0"><div class="ct">${s.kind === 'question' ? 'Open question' : 'Blocker'}</div><div class="cm">${esc(s.project)} · ${esc(s.branch)} · ${timeAgo(s.createdAt)}</div></div>
-      <span style="margin-left:auto"><span class="status need"><span class="d"></span>Needs you</span></span>
+      <span style="margin-left:auto"><span class="status ${status[0]}"><span class="d"></span>${status[1]}</span></span>
     </div>
     <p class="body">${linkify(esc(s.msg))}</p>
     <div class="cfoot">clear with <code class="k">ccmd resolve ${esc(s.id)}</code></div>
-    ${showAck ? `<div class="ackrow"><button class="ack" type="button" data-key="${esc(s.key)}"><span class="box">${UI.check}</span><span class="lab">Mark read</span></button></div>` : ''}
+    ${showAck ? `<div class="ackrow"><button class="ack" type="button" data-key="${esc(s.key)}"><span class="box">${UI.check}</span><span class="lab">${s.seen ? 'Read' : 'Mark read'}</span></button></div>` : ''}
   </article>`;
 }
 
@@ -777,6 +797,7 @@ function cmdServe(args) {
       return;
     }
     if ((req.url === '/seen' || req.url === '/unseen')) {
+      if (!feat('seen')) { res.writeHead(404).end(); return; } // feature off → no read endpoint
       if (req.method !== 'POST') { res.writeHead(405).end(); return; }
       const ct = String(req.headers['content-type'] || '');
       if (!ct.includes('application/json')) { res.writeHead(415).end(); return; }
