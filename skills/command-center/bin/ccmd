@@ -38,21 +38,27 @@ const DEFAULT_ACCENT = '#0a84ff';
 const DEFAULT_FEATURES = { goals: true, seen: true, mirror: false };
 
 // ---------- tiny utils ----------
+// The store can hold status text you don't want other local users to read, so we
+// keep it private: dirs 0700, files 0600. On non-POSIX platforms these modes are
+// best-effort (Windows ignores them) — hence the try/catch.
+function chmodQuiet(p, mode) { try { fs.chmodSync(p, mode); } catch {} }
 function ensureDirs() {
   // one-time migration: the "loops" feature was renamed to "goals".
   try {
     const oldDir = path.join(HOME, 'loops'), newDir = path.join(HOME, 'goals');
     if (fs.existsSync(oldDir) && !fs.existsSync(newDir)) fs.renameSync(oldDir, newDir);
   } catch {}
-  for (const d of Object.values(DIRS)) fs.mkdirSync(d, { recursive: true });
+  try { fs.mkdirSync(HOME, { recursive: true, mode: 0o700 }); } catch {}
+  chmodQuiet(HOME, 0o700); // tighten pre-existing installs
+  for (const d of Object.values(DIRS)) { fs.mkdirSync(d, { recursive: true, mode: 0o700 }); chmodQuiet(d, 0o700); }
 }
 function readJSON(p, fallback) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
 }
 function writeAtomic(p, data) {
-  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
   const tmp = p + '.tmp-' + process.pid + '-' + Date.now();
-  fs.writeFileSync(tmp, data);
+  fs.writeFileSync(tmp, data, { mode: 0o600 });
   fs.renameSync(tmp, p);
 }
 function writeJSON(p, obj) { writeAtomic(p, JSON.stringify(obj, null, 2) + '\n'); }
@@ -274,6 +280,23 @@ function seenOff() {
   if (feat('seen')) return false;
   process.stdout.write('read-relay (seen) feature is off (set features.seen=true in config.json)\n');
   process.exitCode = 1; return true;
+}
+// `ccmd read` consumes a pasted `ccmd-read: k1, k2, …` line as STRUCTURED input
+// (stdin or args) and validates every key internally — so the agent never has to
+// interpolate untrusted tokens from the clipboard into a shell command.
+function cmdRead(args) {
+  if (seenOff()) return;
+  let raw = '';
+  if (args._.length) raw = args._.join(' ');
+  else { try { if (!process.stdin.isTTY) raw = fs.readFileSync(0, 'utf8'); } catch {} }
+  const m = /ccmd-read:\s*([^\n\r]+)/i.exec(raw) || (raw ? [null, raw] : null);
+  if (!m) { process.stdout.write('usage: echo "ccmd-read: <keys>" | ccmd read\n'); process.exitCode = 1; return; }
+  const tokens = m[1].split(',').map(s => s.trim()).filter(Boolean);
+  let ok = 0, bad = 0;
+  for (const k of tokens) {
+    if (validKeyFormat(k)) { markSeen(k); ok++; } else bad++; // never shells out; pure validation
+  }
+  process.stdout.write(`marked ${ok} read${bad ? ` (${bad} ignored — bad key format)` : ''}\n`);
 }
 function cmdSeen(args) { if (seenOff()) return; const k = args._[0]; if (!k || !validKeyFormat(k)) { process.stdout.write('usage: ccmd seen <entry:project/branch|signal:id>\n'); process.exitCode = 1; return; } markSeen(k); process.stdout.write(`seen ${k}\n`); }
 function cmdUnseen(args) { if (seenOff()) return; const k = args._[0]; if (!k || !validKeyFormat(k)) { process.stdout.write('usage: ccmd unseen <entry:project/branch|signal:id>\n'); process.exitCode = 1; return; } clearSeen(k); process.stdout.write(`unseen ${k}\n`); }
@@ -1074,6 +1097,7 @@ function cmdHelp() {
   ccmd goal --done <id>                              # curated async-work shelf (pairs with Claude Code's /goal)
   ccmd render                                        # regenerate dashboard.html
   ccmd prune [--presence]                            # archive DONE/read entries
+  ccmd read                                          # stdin: a "ccmd-read: k1, k2" line → marks read (validated, no shell)
   ccmd seen <key> | ccmd unseen <key>                # key: entry:<project>/<branch> | signal:<id>
   ccmd check [--since <epoch_ms>]                    # JSON {exists,fresh} for the cwd's entry (Stop hook)
   ccmd mirror [--fragment] [--out file.html]         # optional hosted-mirror HTML export
@@ -1109,6 +1133,7 @@ function main() {
       case 'render': return cmdRender(args);
       case 'mirror': return cmdMirror(args);
       case 'prune': return cmdPrune(args);
+      case 'read': return cmdRead(args);
       case 'seen': return cmdSeen(args);
       case 'unseen': return cmdUnseen(args);
       case 'check': return cmdCheck(args);
