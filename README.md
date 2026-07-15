@@ -21,16 +21,34 @@ dependencies**.
 npx skills add chakkyy/agent-command-center
 ```
 
-That drops the `command-center` skill into your agent. Then, once:
+That drops the `command-center` skill into your agent.
 
-```bash
-ccmd init      # interactive setup: your products, theme, features
-ccmd demo      # optional: seed an example board to look at first
-ccmd serve     # → http://localhost:7777
+**This is agent-first.** The `ccmd` CLI ships *inside* the skill — it's not on
+your `PATH`, and you're not meant to type it into a shell yourself. Your agent
+runs it for you. Inside Claude Code the skill is a slash command, so just:
+
+```text
+/command-center            → set it up, or open the board
+/command-center serve      → run the live dashboard
 ```
 
-> `ccmd` lives in `skills/command-center/bin/ccmd`. Put it on your `PATH`, alias
-> it, or let the [hooks](hooks/) call it by absolute path.
+…or ask in plain language ("set up the command-center skill", "open the board").
+On first use the skill's `SKILL.md` walks the agent through interviewing you
+(products, theme, features) and running `ccmd init` — so **`ccmd: command not
+found` never happens**, because you never type `ccmd`. The agent does, by path.
+
+<details><summary>Running <code>ccmd</code> yourself in a terminal (optional)</summary>
+
+Point a shell alias at the bundled binary first:
+
+```bash
+# it lives at skills/command-center/bin/ccmd wherever the skill was installed
+alias ccmd="$(pwd)/skills/command-center/bin/ccmd"
+ccmd init && ccmd serve
+```
+
+The [hooks](hooks/) call it by absolute path (`ACC_CCMD`), so they need no alias.
+</details>
 
 ## How it works
 
