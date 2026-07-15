@@ -31,6 +31,7 @@ const DIRS = {
 };
 const CONFIG_PATH = path.join(HOME, 'config.json');
 const DASHBOARD_PATH = path.join(HOME, 'dashboard.html');
+const DEMO_MARKER = path.join(HOME, '.demo-store'); // present only in a store seeded by `ccmd demo`
 
 const STALE_MS = 6 * 60 * 60 * 1000; // 6h without update => greyed
 const DEFAULT_ACCENT = '#0a84ff';
@@ -96,6 +97,39 @@ function isSeen(key) { return fs.existsSync(keyToFile(key)); }
 function markSeen(key) { writeAtomic(keyToFile(key), new Date().toISOString() + '\n'); }
 function clearSeen(key) { try { fs.unlinkSync(keyToFile(key)); } catch {} }
 
+// Strict grammar for a board key: `entry:<project>/<branch>` or `signal:<id>`.
+// The segments use the same charset as slug(), and the referenced item must exist —
+// so /seen and the `ccmd-read:` relay can never mint or traverse to arbitrary files.
+const SEG = '[A-Za-z0-9._@-]{1,120}';
+const KEY_RE = new RegExp(`^(?:entry:${SEG}/${SEG}|signal:${SEG})$`);
+function validKey(key) {
+  if (typeof key !== 'string' || key.length > 260 || !KEY_RE.test(key)) return false;
+  if (key.startsWith('entry:')) {
+    const rest = key.slice(6);
+    const i = rest.indexOf('/');
+    const project = rest.slice(0, i), branch = rest.slice(i + 1);
+    return fs.existsSync(path.join(DIRS.entries, project, branch + '.json'));
+  }
+  const id = key.slice(7);
+  return fs.existsSync(path.join(DIRS.signals, id + '.json'));
+}
+
+// A store is "demo" only if `ccmd demo` seeded it (marker file). Any real write clears it,
+// so `ccmd demo` can never silently clobber real data (blocker: demo data-loss).
+function isDemoStore() { return fs.existsSync(DEMO_MARKER); }
+function markDemoStore() { try { writeAtomic(DEMO_MARKER, new Date().toISOString() + '\n'); } catch {} }
+function clearDemoMarker() { try { fs.unlinkSync(DEMO_MARKER); } catch {} }
+function storeHasData() {
+  const anyIn = (dir, nested) => {
+    for (const a of safeReaddir(dir)) {
+      if (nested) { if (safeReaddir(path.join(dir, a)).some(f => f.endsWith('.json'))) return true; }
+      else if (a.endsWith('.json')) return true;
+    }
+    return false;
+  };
+  return anyIn(DIRS.entries, true) || anyIn(DIRS.signals, false) || anyIn(DIRS.goals, false);
+}
+
 // ---------- arg parsing ----------
 function parseArgs(argv) {
   const out = { _: [] };
@@ -150,6 +184,7 @@ function cmdReport(args) {
   const file = path.join(DIRS.entries, project, slug(branch) + '.json');
   writeJSON(file, entry);
   clearSeen(key); // a fresh update re-surfaces the row
+  clearDemoMarker(); // a real report means this is no longer a demo store
   process.stdout.write(`reported ${project}/${branch} [${entry.status}]\n`);
 }
 
@@ -166,6 +201,7 @@ function cmdSignal(args) {
     resolved: false,
   };
   writeJSON(path.join(DIRS.signals, id + '.json'), sig);
+  clearDemoMarker();
   process.stdout.write(`${id}\n`); // print id so the agent can `ccmd resolve <id>`
 }
 
@@ -229,6 +265,7 @@ function cmdGoal(args) {
     updatedAt: new Date().toISOString(),
   });
   writeJSON(p, item);
+  clearDemoMarker();
   process.stdout.write(`goal ${item.id} [${item.status}]\n`);
 }
 
@@ -702,26 +739,65 @@ function cmdData() {
 }
 
 // ---------- server ----------
+// A cheap fingerprint of the store: newest mtime + item count across the live
+// dirs. The client polls /hash and only refreshes when this changes (no blind
+// reload → no flicker).
+function storeHash() {
+  let newest = 0, count = 0;
+  for (const d of [DIRS.entries, DIRS.signals, DIRS.goals, DIRS.seen]) {
+    for (const a of safeReaddir(d)) {
+      const p = path.join(d, a);
+      let st; try { st = fs.statSync(p); } catch { continue; }
+      if (st.isDirectory()) {
+        for (const f of safeReaddir(p)) {
+          let s2; try { s2 = fs.statSync(path.join(p, f)); } catch { continue; }
+          count++; if (s2.mtimeMs > newest) newest = s2.mtimeMs;
+        }
+      } else { count++; if (st.mtimeMs > newest) newest = st.mtimeMs; }
+    }
+  }
+  return `${count}-${Math.round(newest)}`;
+}
 function cmdServe(args) {
   ensureDirs();
   const port = parseInt(args.port || process.env.ACC_PORT || '7777', 10);
+  // Reject cross-origin/rebinding: only localhost Host headers are served.
+  const hostOk = (req) => {
+    const h = String(req.headers.host || '');
+    const name = h.replace(/:\d+$/, '');
+    return name === 'localhost' || name === '127.0.0.1' || name === '[::1]' || name === '';
+  };
   const server = http.createServer((req, res) => {
-    if (req.method === 'POST' && (req.url === '/seen' || req.url === '/unseen')) {
-      let body = '';
-      req.on('data', c => { body += c; if (body.length > 1e5) req.destroy(); });
+    if (!hostOk(req)) { res.writeHead(403).end(); return; }
+    if (req.method === 'GET' && req.url === '/hash') {
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+      res.end(storeHash());
+      return;
+    }
+    if ((req.url === '/seen' || req.url === '/unseen')) {
+      if (req.method !== 'POST') { res.writeHead(405).end(); return; }
+      const ct = String(req.headers['content-type'] || '');
+      if (!ct.includes('application/json')) { res.writeHead(415).end(); return; }
+      let body = '', done = false;
+      const fail = (code) => { if (done) return; done = true; try { res.writeHead(code).end(); } catch {} try { req.destroy(); } catch {} };
+      req.on('error', () => {});
+      req.on('data', c => { if (done) return; body += c; if (body.length > 1e5) fail(413); });
       req.on('end', () => {
+        if (done) return; done = true;
         try {
           const { key } = JSON.parse(body || '{}');
-          if (key) (req.url === '/seen' ? markSeen : clearSeen)(key);
+          // Only keys that already exist on the board may be toggled — /seen can't mint arbitrary files.
+          if (key && validKey(key)) (req.url === '/seen' ? markSeen : clearSeen)(key);
         } catch {}
         res.writeHead(204).end();
       });
       return;
     }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    if (req.method !== 'GET') { res.writeHead(405).end(); return; }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
     res.end(buildHTML({ interactive: true }));
   });
-  server.on('error', (e) => { process.stderr.write(`serve error: ${e.message}\n`); process.exit(0); });
+  server.on('error', (e) => { process.stderr.write(`serve error: ${e.message}\n`); process.exitCode = 1; process.exit(1); });
   server.listen(port, '127.0.0.1', () => {
     process.stdout.write(`Command Center → http://localhost:${port}\n`);
   });
@@ -812,12 +888,13 @@ function cmdInit(args) {
 function cmdDemo(args) {
   ensureDirs();
   // demo resets the store — refuse to clobber real data unless --force or a fresh/demo store.
-  const existing = safeReaddir(DIRS.entries).flatMap(p => safeReaddir(path.join(DIRS.entries, p)));
-  const isDemoStore = (loadConfig().products || []).every(p => ['acme-web', 'acme-api', 'docs'].includes(p.id));
-  if (existing.length && !isDemoStore && !(args && args.force)) {
-    process.stdout.write(`ccmd demo resets the store, but ${HOME} already has data.\n` +
-      `  Re-run with --force to overwrite, or point ACC_HOME at a throwaway dir:\n` +
+  // Refuse to reset unless this is a demo store (marker) or --force. A store with
+  // ONLY signals, ONLY goals, or a single real report all count as real data.
+  if (storeHasData() && !isDemoStore() && !(args && args.force)) {
+    process.stdout.write(`ccmd demo resets the store, but ${HOME} already has real data.\n` +
+      `  Re-run with --force to overwrite it, or point ACC_HOME at a throwaway dir:\n` +
       `  ACC_HOME=/tmp/acc-demo ccmd demo\n`);
+    process.exitCode = 1;
     return;
   }
   const base = fs.existsSync(CONFIG_PATH) ? loadConfig() : defaultConfig();
@@ -862,6 +939,7 @@ function cmdDemo(args) {
     summary: 'Sweep every handler, map ad-hoc errors to the shared taxonomy, document each code.', prereqs: 'the error-taxonomy RFC has to merge first', promptPath: 'goals/acme-api/error-audit.md' });
   goal({ id: 'docs-screenshot-refresh', project: 'docs', title: 'Refresh every screenshot in the docs', status: 'draft', hours: '3',
     summary: 'Re-capture all product screenshots against the new UI, at 2x, and swap them in.', promptPath: 'goals/docs/screenshot-refresh.md' });
+  markDemoStore(); // any subsequent real write (report/signal/goal) clears this
   cmdRender({ quiet: true });
   process.stdout.write(`seeded demo store at ${HOME}\n  4 entries · 2 signals · 3 goals · products: ${demoProducts.map(p => p.id).join(', ')}\n  run: ccmd serve   → http://localhost:7777\n`);
 }
@@ -952,9 +1030,17 @@ function cmdHelp() {
 }
 
 // ---------- dispatch ----------
+// Commands invoked by hooks must never break the hook: the hook scripts already
+// guard with `|| true`, and we also keep their failures quiet. Everything else
+// surfaces a non-zero exit so scripting/CI can detect real failures.
+const MUTATING_CMDS = new Set(['report', 'signal', 'resolve', 'goal', 'loop', 'prune',
+  'init', 'demo', 'seen', 'unseen', 'set-url', 'install', 'link', 'render', 'mirror']);
 function main() {
   const [, , cmd, ...rest] = process.argv;
   const args = parseArgs(rest);
+  // `--help`/`-h` anywhere prints help and NEVER mutates state.
+  // (Fixes the `report --help` footgun that used to overwrite your row with an empty report.)
+  if ((args.help || args.h) && cmd && cmd !== 'get-url') return cmdHelp();
   try {
     switch (cmd) {
       case 'link': return cmdLink(args);
@@ -983,8 +1069,10 @@ function main() {
       default: process.stdout.write(`unknown command: ${cmd}\n`); return cmdHelp();
     }
   } catch (e) {
-    // never blow up a hook
+    // Never throw out of a hook, but surface real failures with a non-zero exit.
+    // Hook scripts call the CLI with `|| true`, so this stays fail-open for them.
     process.stderr.write(`ccmd: ${e && e.message ? e.message : e}\n`);
+    process.exitCode = 1;
   }
 }
 main();

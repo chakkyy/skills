@@ -1,0 +1,22 @@
+{
+  "name": "agent-command-center",
+  "version": "1.0.0",
+  "description": "A shared status board where every coding agent reports what it's doing, what's blocked, and what needs you.",
+  "license": "MIT",
+  "private": true,
+  "bin": {
+    "ccmd": "skills/command-center/bin/ccmd"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "files": [
+    "skills/",
+    "hooks/",
+    "README.md",
+    "LICENSE"
+  ]
+}

@@ -139,8 +139,46 @@
   });
   apply();
 
-  /* ---- auto-refresh (only under ccmd serve) ---- */
+  /* ---- live updates (only under ccmd serve): poll /hash, never blind-reload ---- */
   if (MODE.interactive && location.protocol !== 'file:') {
-    setTimeout(function () { location.reload(); }, 10000);
+    try { history.scrollRestoration = 'manual'; } catch (e) {}
+    // restore scroll after a programmatic reload (the active tab restores via sessionStorage above)
+    try {
+      var sy = sessionStorage.getItem('acc-scroll');
+      if (sy != null) { window.scrollTo(0, parseInt(sy, 10) || 0); sessionStorage.removeItem('acc-scroll'); }
+    } catch (e) {}
+    var POLL = 10000; // ?poll=<ms> tunes the live-update poll interval (min 500)
+    try { var q = new URLSearchParams(location.search).get('poll'); if (q) POLL = Math.max(500, parseInt(q, 10) || 10000); } catch (e) {}
+    var baseline = null, dirty = false, pill = null;
+    function reload() {
+      try { sessionStorage.setItem('acc-scroll', String(window.scrollY || window.pageYOffset || 0)); } catch (e) {}
+      location.reload();
+    }
+    function showPill() {
+      if (!pill) {
+        pill = document.createElement('button');
+        pill.type = 'button';
+        pill.className = 'updpill';
+        pill.setAttribute('aria-live', 'polite');
+        pill.innerHTML = '<span class="d"></span>Updates — refresh';
+        pill.addEventListener('click', reload);
+        document.body.appendChild(pill);
+      }
+      requestAnimationFrame(function () { pill.classList.add('show'); });
+    }
+    // A pending update + the tab going hidden → refresh now, so it's fresh when they return.
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden && dirty) reload();
+    });
+    setInterval(function () {
+      fetch('/hash', { cache: 'no-store' }).then(function (r) { return r.text(); }).then(function (h) {
+        if (baseline === null) { baseline = h; return; }
+        if (h === baseline) return;
+        dirty = true;
+        // Visible → offer a pill (never yank the page out from under an active read/edit).
+        // Hidden → just reload quietly.
+        if (document.hidden) reload(); else showPill();
+      }).catch(function () {});
+    }, POLL);
   }
 })();

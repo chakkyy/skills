@@ -37,15 +37,24 @@ const THEMES = {
 // Match/beat the specificity of style.css's [data-theme] blocks, and come last.
 const SEL = ':root, :root[data-theme="light"], :root[data-theme="dark"]';
 
+// Only a normalized hex color may ever reach the injected <style> — anything else
+// (e.g. `red;}</style><script>…`) is rejected to the default, so config can't XSS the board.
+const HEX_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
+function safeAccent(accent) {
+  const s = String(accent == null ? '' : accent).trim();
+  return HEX_RE.test(s) ? s.toLowerCase() : null;
+}
+
 function themeVars(theme, accent) {
-  const t = THEMES[theme] != null ? theme : 'swiss';
+  const t = typeof theme === 'string' && THEMES[theme] != null ? theme : 'swiss';
   let out = '';
   if (THEMES[t]) out += `${SEL}{${THEMES[t]}}\n`;
-  if (accent) {
-    const soft = hexToRgba(accent, t === 'swiss' ? 0.10 : 0.18) || 'rgba(10,132,255,.16)';
-    out += `${SEL}{--accent:${accent};--accent-soft:${soft};}\n`;
+  const acc = safeAccent(accent);
+  if (acc) {
+    const soft = hexToRgba(acc, t === 'swiss' ? 0.10 : 0.18) || 'rgba(10,132,255,.16)';
+    out += `${SEL}{--accent:${acc};--accent-soft:${soft};}\n`;
   }
   return out;
 }
 
-module.exports = { themeVars, hexToRgba, THEMES };
+module.exports = { themeVars, hexToRgba, safeAccent, THEMES };
