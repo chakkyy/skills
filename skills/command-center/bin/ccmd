@@ -372,13 +372,24 @@ function cmdPrune(args) {
   let archived = 0;
   for (const e of entries) {
     // With the read-relay feature off, "seen" has no meaning — only DONE is archived.
-    if (e.status === 'DONE' || (seenOn && e.seen)) {
-      const src = entryPathFromKey(e.key);
-      writeJSON(path.join(DIRS.archive, `entry-${e.project}-${shortHash(e.key)}-${Date.now()}.json`), e);
-      try { fs.unlinkSync(src); } catch {}
-      clearSeen(e.key);
-      archived++;
+    if (!(e.status === 'DONE' || (seenOn && e.seen))) continue;
+    const src = entryPathFromKey(e.key);
+    // Compare-and-swap via atomic rename: claim the file, then verify it's still the
+    // exact version collect() saw. A concurrent `report` (writeAtomic = temp+rename)
+    // either lands before our claim (we detect a newer updatedAt and restore it) or
+    // after (it recreates src fresh, we archive the old copy we hold). Either way a
+    // fresh report is never deleted.
+    const held = src + '.prune-' + process.pid + '-' + Date.now();
+    try { fs.renameSync(src, held); } catch { continue; } // already gone → nothing to do
+    const cur = readJSON(held, null);
+    if (!cur || cur.updatedAt !== e.updatedAt) {
+      try { fs.renameSync(held, src); } catch {} // changed under us → put it back, skip
+      continue;
     }
+    writeJSON(path.join(DIRS.archive, `entry-${e.project}-${shortHash(e.key)}-${Date.now()}.json`), cur);
+    try { fs.unlinkSync(held); } catch {}
+    clearSeen(e.key);
+    archived++;
   }
   if (args.presence) { const c = loadConfig(); c.lastPresence = new Date().toISOString(); saveConfig(c); }
   cmdRender({ quiet: true });
