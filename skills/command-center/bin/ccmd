@@ -770,6 +770,8 @@ function cmdInit(args) {
       features,
     }, base);
     process.stdout.write(`wrote ${CONFIG_PATH}\n  theme=${c.theme} accent=${c.accent} products=${c.products.length} features=${Object.keys(c.features).filter(k => c.features[k]).join(',') || 'core-only'}\n`);
+    if (args.slash || args['install-slash']) cmdInstall({});
+    else process.stdout.write(`  Tip: run 'ccmd install' to add the /ccmd slash command for Claude Code.\n`);
     cmdRender({ quiet: true });
     return;
   }
@@ -796,9 +798,12 @@ function cmdInit(args) {
       seen: await yn('Enable read-relay (mark read / copy)?', 'y'),
       mirror: await yn('Enable hosted mirror export?', 'n'),
     };
+    const wantSlash = await yn('Add the /ccmd slash command for Claude Code?', 'y');
     rl.close();
     const c = writeConfigFrom({ products, theme, accent, features }, defaultConfig());
-    process.stdout.write(`\nwrote ${CONFIG_PATH}\nRun \`ccmd demo\` to preview, or \`ccmd serve\` and open http://localhost:7777\n`);
+    process.stdout.write(`\nwrote ${CONFIG_PATH}\n`);
+    if (wantSlash) cmdInstall({});
+    process.stdout.write(`Run \`ccmd demo\` to preview, or \`ccmd serve\` and open http://localhost:7777\n`);
     cmdRender({ quiet: true });
   })();
 }
@@ -883,11 +888,47 @@ function cmdLink(args) {
 
 function cmdWhere() { process.stdout.write(path.resolve(__filename) + '\n'); }
 
+// ---------- install (write a Claude Code slash command that runs this CLI) ----------
+function slashCommandBody(target, name) {
+  return `---
+description: Command Center — run the ccmd status-board CLI (serve, goal, report, init, …)
+argument-hint: [serve|goal|report|init|link|render] [args]
+---
+The Command Center CLI (\`ccmd\`) is bundled at this absolute path:
+
+\`${target}\`
+
+Run \`${target} $ARGUMENTS\` with the Bash tool, **from the current repository** so
+its git project/branch context is right. If \`$ARGUMENTS\` is empty, run
+\`${target} serve\` (start it in the background) and give me the
+http://localhost:7777 URL.
+
+Notes: \`ccmd\` writes only to the local store under \`$ACC_HOME\` (default
+\`~/.agents-command-center\`) and never needs the network. \`serve\` is long-running —
+run it in the background. For the full reporting protocol (when to report / signal
+/ shelve goals), load the \`command-center\` skill. Never hand-edit the board HTML.
+`;
+}
+function cmdInstall(args) {
+  const target = path.resolve(__filename);
+  const name = args.name ? slug(String(args.name)).toLowerCase() : 'ccmd';
+  const dir = args.dir ? String(args.dir) : path.join(os.homedir(), '.claude', 'commands');
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, name + '.md');
+    fs.writeFileSync(file, slashCommandBody(target, name));
+    process.stdout.write(`wrote /${name} slash command -> ${file}\n  In Claude Code, type: /${name} serve   (or /${name} goal …, /${name} report …)\n`);
+  } catch (e) {
+    process.stdout.write(`could not write the slash command (${e.message}). Skipping.\n`);
+  }
+}
+
 function cmdHelp() {
   process.stdout.write(`ccmd — Command Center (machine-wide agent status board)
   This binary ships inside the skill and is NOT on your PATH by default. Run it by
   absolute path, or run 'ccmd link' once to expose it as a real 'ccmd' command.
   ccmd link [--dir <bin>]                            # symlink this binary onto PATH (~/.local/bin)
+  ccmd install [--name ccmd] [--dir <commands>]      # write a Claude Code slash command (~/.claude/commands/ccmd.md)
   ccmd where                                         # print this binary's absolute path
   ccmd init [--theme swiss|terminal|soft] [--accent "#0a84ff"] [--features goals,seen,mirror] [--product "id:Label:repo1,repo2"]…
                                                      # first-run setup; no flags + a TTY => wizard
@@ -918,6 +959,7 @@ function main() {
     switch (cmd) {
       case 'link': return cmdLink(args);
       case 'where': return cmdWhere();
+      case 'install': return cmdInstall(args);
       case 'init': return cmdInit(args);
       case 'demo': return cmdDemo(args);
       case 'report': return cmdReport(args);

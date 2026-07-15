@@ -37,10 +37,18 @@ On first use the skill's `SKILL.md` walks the agent through interviewing you
 (products, theme, features) and running `ccmd init` — so **`ccmd: command not
 found` never happens**, because you never type `ccmd`. The agent does, by path.
 
-<details><summary>Want a real <code>ccmd</code> command? (optional, one line)</summary>
+**Want a real `/ccmd` command?** `ccmd init` offers it, or run it any time — it
+writes a Claude Code slash command with the binary's path baked in:
 
-The binary ships inside the skill and isn't on your `PATH`. To turn it into a
-first-class command, link it once — the agent can do this for you, or you can:
+```text
+ccmd install          # → ~/.claude/commands/ccmd.md
+/ccmd serve           # then, in Claude Code: run the board
+/ccmd goal --status ready --title "…"
+```
+
+<details><summary>Prefer a plain shell <code>ccmd</code>? (optional)</summary>
+
+Link the bundled binary onto your `PATH` once — the agent can do this for you:
 
 ```bash
 # from wherever the skill was installed:

@@ -32,9 +32,12 @@ Then call it by that path from **inside the user's repo** (so git context is
 right): `"$CCMD" report …`. In every example below, `ccmd` is shorthand for that
 absolute path. Two things that make later calls plain `ccmd`:
 
+- **`"$CCMD" install`** — writes a Claude Code `/ccmd` slash command with this
+  path baked in, so the user can run `/ccmd serve`, `/ccmd goal …` themselves.
+  Offer this on first setup.
 - **`"$CCMD" link`** — symlinks it onto PATH (`~/.local/bin`); after that, and for
-  the hooks, plain `ccmd` works. Offer this to the user on first setup.
-- If the user already ran `link` (or aliased it), just use `ccmd` directly.
+  the hooks, plain `ccmd` works.
+- If the user already ran `link`/`install` (or aliased it), just use `ccmd`.
 
 **The board is 100% generated.** The UI lives in `template/` and `ccmd` renders
 it identically for `dashboard.html`, `ccmd serve` and the optional hosted

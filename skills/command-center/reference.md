@@ -13,12 +13,16 @@ without touching your real one.
 run it by absolute path, or link it once:
 
 ```
-ccmd link [--dir <bin>]  # symlink the binary into a PATH dir (default ~/.local/bin)
-ccmd where               # print the binary's absolute path
+ccmd link [--dir <bin>]              # symlink the binary into a PATH dir (default ~/.local/bin)
+ccmd install [--name ccmd] [--dir d] # write a Claude Code slash command (default ~/.claude/commands/ccmd.md)
+ccmd where                           # print the binary's absolute path
 ```
 
-`ccmd where` is handy for agents/hooks that need the absolute path
-(`ACC_CCMD="$(…/bin/ccmd where)"`).
+`ccmd install` writes a `/ccmd` slash command whose body has this binary's
+absolute path baked in — so inside Claude Code you can `/ccmd serve`, `/ccmd goal
+…`, `/ccmd report …` with no PATH setup and no "command not found". `--name`
+renames the command; `--dir` targets a project's `.claude/commands/` instead of
+the personal one. `ccmd where` is handy for hooks (`ACC_CCMD="$(…/bin/ccmd where)"`).
 
 ## Setup
 
