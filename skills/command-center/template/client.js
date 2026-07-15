@@ -72,28 +72,30 @@
   var savedTab = null; try { savedTab = sessionStorage.getItem('acc-tab'); } catch (e) {}
   if (savedTab && segBtns.some(function (b) { return b.dataset.tab === savedTab; })) select(savedTab);
 
-  /* ---- read state ---- */
-  var STORE = 'acc-read-v1'; // real store keys (entry:<p>/<b> / signal:<id>)
-  /* NOTE: never [].slice.call over a Set (not array-like: returns []). Array.from always. */
-  function load() { try { return new Set(JSON.parse(localStorage.getItem(STORE) || '[]')); } catch (e) { return new Set(); } }
-  function save(s) { try { localStorage.setItem(STORE, JSON.stringify(Array.from(s))); } catch (e) {} }
+  /* ---- read state (versioned by data-rev so a re-reported item is NOT stuck "read") ---- */
+  var STORE = 'acc-read-v2'; // { key: rev } — a card is read only if its rev still matches
+  function load() { try { var o = JSON.parse(localStorage.getItem(STORE) || '{}'); return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {}; } catch (e) { return {}; } }
+  function save(s) { try { localStorage.setItem(STORE, JSON.stringify(s)); } catch (e) {} }
   var state = load();
   var relay = $('.relay'), relayBox = $('.relaybox'), relayTa = relayBox ? relayBox.querySelector('textarea') : null;
 
-  function relayLine() { return 'ccmd-read: ' + Array.from(state).join(', '); }
+  function cardRead(c) { return Object.prototype.hasOwnProperty.call(state, c.dataset.ack) && state[c.dataset.ack] === (c.dataset.rev || ''); }
+  function readCards() { return [].slice.call(document.querySelectorAll('[data-ack]')).filter(cardRead); }
+  function relayLine() { return 'ccmd-read: ' + readCards().map(function (c) { return c.dataset.ack; }).join(', '); }
   function apply() {
+    var n = 0;
     document.querySelectorAll('[data-ack]').forEach(function (c) {
-      var on = state.has(c.dataset.ack);
+      var on = cardRead(c); if (on) n++;
       c.classList.toggle('read', on);
       var lab = c.querySelector('.ack .lab');
       if (lab) lab.textContent = on ? 'Read' : 'Mark read';
     });
     if (relay) {
-      relay.querySelector('.rn').textContent = state.size;
-      relay.classList.toggle('show', state.size > 0);
+      relay.querySelector('.rn').textContent = n;
+      relay.classList.toggle('show', n > 0);
     }
     if (relayBox) {
-      if (state.size === 0) relayBox.classList.remove('show');
+      if (n === 0) relayBox.classList.remove('show');
       else if (relayBox.classList.contains('show') && relayTa) relayTa.value = relayLine();
     }
   }
@@ -118,15 +120,16 @@
   document.addEventListener('click', function (e) {
     var a = e.target.closest('.ack');
     if (a) {
-      var k = a.dataset.key;
-      if (state.has(k)) { state.delete(k); postSeen('/unseen', k); }
-      else { state.add(k); postSeen('/seen', k); }
+      var card = a.closest('[data-ack]'); if (!card) return;
+      var k = card.dataset.ack, rev = card.dataset.rev || '';
+      if (state[k] === rev) { delete state[k]; postSeen('/unseen', k); }
+      else { state[k] = rev; postSeen('/seen', k); }
       save(state); apply();
       return;
     }
     if (e.target.closest('.relay .clear')) {
-      Array.from(state).forEach(function (k) { postSeen('/unseen', k); });
-      state.clear(); save(state); apply();
+      Object.keys(state).forEach(function (k) { postSeen('/unseen', k); });
+      state = {}; save(state); apply();
       return;
     }
     if (e.target.closest('.relay .copy')) {

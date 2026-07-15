@@ -577,7 +577,7 @@ function entryCard(e, prodIcon, showAck) {
   for (const x of (e.inFlight || [])) metabits.push(esc(x));
   if (e.done && e.done.length) metabits.push(`<b>${e.done.length} ✓</b> · ${esc(e.done[e.done.length - 1])}`);
   const meta = [e.project, e.branch, e.agent, e.tier].filter(Boolean).join(' · ');
-  return `<article class="card${e.ui.stale ? ' stale' : ''}" data-ack="${esc(e.key)}">
+  return `<article class="card${e.ui.stale ? ' stale' : ''}" data-ack="${esc(e.key)}" data-rev="${esc(e.updatedAt || '')}">
     <div class="chead">
       <span class="pic">${prodIcon}</span>
       <div style="min-width:0"><div class="ct">${esc(e.task || e.branch)}</div><div class="cm">${esc(meta)} · ${timeAgo(e.updatedAt)}</div></div>
@@ -597,7 +597,7 @@ function signalCard(s, prodIcon, showAck) {
   // Read but unresolved → dimmed + "Acknowledged"; it only leaves on `ccmd resolve`.
   const ack = showAck && s.seen;
   const status = ack ? ['idle', 'Acknowledged'] : ['need', 'Needs you'];
-  return `<article class="card${ack ? ' read' : ''}" data-ack="${esc(s.key)}">
+  return `<article class="card${ack ? ' read' : ''}" data-ack="${esc(s.key)}" data-rev="${esc(s.createdAt || '')}">
     <div class="chead">
       <span class="pic">${prodIcon}</span>
       <div style="min-width:0"><div class="ct">${s.kind === 'question' ? 'Open question' : 'Blocker'}</div><div class="cm">${esc(s.project)} · ${esc(s.branch)} · ${timeAgo(s.createdAt)}</div></div>
