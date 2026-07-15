@@ -729,22 +729,22 @@ function buildHTML({ interactive, fragment }) {
     { i: STEP.loop, t: 'The circle closes', d: 'Paste that line into any agent chat; it runs <code>ccmd seen</code> per key and the board drops those items.' },
   ];
   const flowSteps = showAck ? flow : flow.filter(s => s !== flow[2] && s !== flow[3]);
-  const changelog = [
-    { ver: 'now', t: 'Generated from the store, one UI', d: 'The board is 100% data-driven and renders identically for the local dashboard, the live server and an optional hosted mirror.', bullets: [
-      'Overview = triage: one line per item and per-product counts; the full detail lives in each product tab, and every Overview card jumps to it.',
-      'Cards come straight from <code>ccmd report</code> / <code>ccmd signal</code>, with the real store keys.',
-      'Three themes (swiss / terminal / soft) + a custom accent, injected as CSS variables at render time.',
-      'Feature toggles (goals / read-relay / mirror) turn tabs, commands and board sections on and off.',
+  const notes = [
+    { ver: 'view', t: 'Where you read the board', d: `You're looking at the live local server (<code>ccmd serve</code> → localhost) — it updates in place, private to your machine. A hosted mirror (a shareable URL) is optional and off by default; enable it with <code>features.mirror</code> if your team wants a shared link.`, bullets: [] },
+    { ver: 'how', t: 'One UI, from the store', d: 'The board is 100% generated from the local store — nobody hand-edits HTML.', bullets: [
+      'Overview = triage: one line per item + per-product counts; the full detail lives in each product tab.',
+      'Cards come straight from <code>ccmd report</code> / <code>ccmd signal</code>.',
+      'Three themes (swiss / terminal / soft) + a custom accent.',
+      'Feature toggles (goals / read-relay / mirror) turn tabs, commands and sections on and off.',
     ] },
-    { ver: 'why', t: 'We moved to local-first', d: 'This started life publishing an HTML mirror to a hosted artifact every turn. That was pure overhead — re-uploading the whole board on every report. The live <code>ccmd serve</code> at localhost is now the default; the mirror survives only as an optional adapter for teams that want a shared URL.', bullets: [] },
   ];
   const commandCenterHTML = `<div class="panel" role="tabpanel" id="panel-command-center" aria-labelledby="tab-command-center" data-tab="command-center" hidden tabindex="0">
     <p class="kick">Command Center · the meta-project</p>
     <h2>The loop, in ${showAck ? 'four' : 'two'} steps</h2>
     <p class="sub">How state flows from the agents to your eyes, and back.</p>
     <div class="flow">${flowSteps.map(s => `<div class="step"><span class="i">${s.i}</span><div><div class="t">${s.t}</div><div class="d">${s.d}</div></div></div>`).join('')}</div>
-    <p class="kick">Changelog</p>
-    <div class="log">${changelog.map(c => `<div class="logitem"><div class="lh"><span class="ver">${c.ver}</span><span class="lt">${c.t}</span></div><p class="ld">${c.d}</p>${c.bullets.length ? `<ul>${c.bullets.map(b => `<li>${b}</li>`).join('')}</ul>` : ''}</div>`).join('')}</div>
+    <p class="kick">Good to know</p>
+    <div class="log">${notes.map(c => `<div class="logitem"><div class="lh"><span class="ver">${c.ver}</span><span class="lt">${c.t}</span></div><p class="ld">${c.d}</p>${c.bullets.length ? `<ul>${c.bullets.map(b => `<li>${b}</li>`).join('')}</ul>` : ''}</div>`).join('')}</div>
   </div>`;
 
   // --- header + shell
@@ -958,17 +958,21 @@ function cmdInit(args) {
     const theme = (await ask(`\nTheme (${THEME_NAMES.join('/')}):`, 'swiss')).toLowerCase();
     const accent = await ask('Accent color (hex):', DEFAULT_ACCENT);
     const yn = (q, d) => ask(q + ' (y/n):', d).then(a => /^y/i.test(a));
+    process.stdout.write('\nFeatures:\n');
     const features = {
-      goals: await yn('Enable goals (async work shelf)?', 'y'),
-      seen: await yn('Enable read-relay (mark read / copy)?', 'y'),
-      mirror: await yn('Enable hosted mirror export?', 'n'),
+      goals: await yn('  goals — a shelf of async work you fire with /goal', 'y'),
+      seen: await yn('  read-relay — mark cards read / "copy what I read"', 'y'),
+      // Viewing mode: the local server is ALWAYS available; the mirror is an extra
+      // shareable hosted page (e.g. a Claude Artifact or GitHub Pages), off by default.
+      mirror: await yn('  hosted mirror — also publish a shareable board URL (local server is always on)', 'n'),
     };
-    const wantSlash = await yn('Add the /ccmd slash command for Claude Code?', 'y');
+    const wantSlash = await yn('\nAdd the /ccmd slash command for Claude Code?', 'y');
     rl.close();
     const c = writeConfigFrom({ products, theme, accent, features }, defaultConfig());
     process.stdout.write(`\nwrote ${CONFIG_PATH}\n`);
     if (wantSlash) cmdInstall({});
     process.stdout.write(`Run \`ccmd demo\` to preview, or \`ccmd serve\` and open http://localhost:7777\n`);
+    process.stdout.write(`Tip: for accurate timestamps in long agent sessions, add the time-awareness util:\n  claude plugin marketplace add chakkyy/agent-utils && /plugin install time-awareness@agent-utils\n`);
     cmdRender({ quiet: true });
   })();
 }

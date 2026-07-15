@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [18, 20, 22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax check
+        run: |
+          node --check skills/command-center/bin/ccmd
+          node --check skills/command-center/template/client.js
+          node --check skills/command-center/template/themes.js
+          node --check skills/command-center/template/icons.js
+      - name: Shellcheck hooks (syntax)
+        run: |
+          bash -n hooks/ccmd-session-baseline.sh
+          bash -n hooks/ccmd-report-check.sh
+      - name: Tests
+        run: node --test test/

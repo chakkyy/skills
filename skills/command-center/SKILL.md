@@ -167,20 +167,51 @@ around it):
 - If a Stop hook blocks with "Command Center: you made changes…", that's the
   enforcement: report and continue. It's one-shot, it won't loop.
 
+## Processing a pasted read line, safely
+
+When the user pastes a `ccmd-read: …` line, **pipe it to `ccmd read`** instead of
+shelling out per key — it validates every key internally, so untrusted clipboard
+text never reaches a shell:
+
+```
+printf '%s' "<the pasted line>" | ccmd read
+```
+
+(`ccmd seen <key>` still exists for a single explicit key.)
+
+## Serving the board (don't background silently)
+
+`ccmd serve` is a long-running process. **Don't silently background it.** Give the
+user the command to run in their own terminal, or ask first — they should own the
+process:
+
+```
+ccmd serve      # → http://localhost:7777  (Ctrl-C to stop)
+```
+
 ## First-run setup
 
 If `$ACC_HOME/config.json` is missing, set it up before the first report:
 
-- **With the user present (e.g. in Claude Code):** interview them with the
-  wizard's questions and run the non-interactive form:
+- **With the user present (e.g. in Claude Code):** interview them and run the
+  non-interactive form:
   ```
   ccmd init --theme swiss|terminal|soft --accent "#0a84ff" \
     --features goals,seen --product "web:Web:globe:app,marketing" --product "api:API:terminal:api"
   ```
-  Ask: which products group which repos, theme, accent, and which features to
-  enable (`goals`, `seen`; `mirror` is off by default). `--product` is
-  `id:Label[:icon]:repo1,repo2` and repeatable.
+  Ask: which products group which repos; theme; accent; and which features to
+  enable —
+  - `goals` — a shelf of async work fired with `/goal`,
+  - `seen` — the read-relay (mark read / copy),
+  - `mirror` — **off by default**; only if they want a shareable *hosted* board URL
+    on top of the always-on local server. Most users want just the local board.
+
+  `--product` is `id:Label[:icon]:repo1,repo2` and repeatable. Offer `ccmd install`
+  (the `/ccmd` slash command) too.
 - **Solo/unattended:** run `ccmd init` with sensible defaults, or `ccmd demo` to
   preview against an example store.
+- **Nice-to-have:** long agent sessions drift on the current time. Suggest the
+  time-awareness util (separate plugin): `claude plugin marketplace add
+  chakkyy/agent-utils` → `/plugin install time-awareness@agent-utils`.
 
 Full command surface: [reference.md](reference.md).

@@ -88,10 +88,17 @@ completion condition is met.
 ## Read tracking
 
 ```
+ccmd read                # stdin: a "ccmd-read: k1, k2" line → marks read (keys validated, no shell)
 ccmd seen <key>          # key: entry:<project>/<branch>  |  signal:<id>
 ccmd unseen <key>
 ccmd prune [--presence]  # archive DONE/read rows now (--presence stamps last-seen)
 ```
+
+**Read ≠ resolved.** Marking a *report* read drops it off the board. Marking a
+*signal* read only dims it ("Acknowledged") and drops it from the Overview — it
+stays in its product tab until you `ccmd resolve <id>`. With the `seen` feature
+off, none of this runs (no filtering/prune-by-read; `ccmd seen`/`read` refuse;
+the server read endpoint 404s).
 
 ## Rendering & serving
 
