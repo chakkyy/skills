@@ -29,4 +29,6 @@ jobs:
           bash -n hooks/ccmd-session-baseline.sh
           bash -n hooks/ccmd-report-check.sh
       - name: Tests
-        run: node --test test/
+        # shell-expanded glob: recent Node 22.x stopped expanding a directory
+        # arg for --test (tries to require the dir), and glob args need Node ≥21
+        run: node --test test/*.test.js
