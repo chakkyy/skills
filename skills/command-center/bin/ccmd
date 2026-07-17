@@ -263,21 +263,31 @@ function cmdResolve(args) {
 // completion condition is met. Agents curate the full prompt + specs/links and
 // shelve it here (grouped by product) so you can fire one off with Claude Code's
 // /goal any time. (Toggle: features.goals)
+// Canonical goal id. The trailing-'_' re-trim matters: slice(0,48) can cut
+// mid-word and reintroduce a '_' that slug() would strip on the next pass, so
+// without it the id printed at creation doesn't resolve in `goal --done`.
+function goalId(s) { return slug(String(s)).toLowerCase().slice(0, 48).replace(/_+$/, '') || 'x'; }
+
 function cmdGoal(args) {
   if (!feat('goals')) { process.stdout.write('goals feature is off (set features.goals=true in config.json)\n'); return; }
   ensureDirs();
   fs.mkdirSync(DIRS.goals, { recursive: true });
   if (args._[0] === 'add') args._.shift(); // `ccmd goal add …` sugar == `ccmd goal …`
   if (args.done) {
-    const p = path.join(DIRS.goals, slug(String(args.done)).toLowerCase().slice(0, 48) + '.json');
-    const it = readJSON(p, null);
+    let p = path.join(DIRS.goals, goalId(args.done) + '.json');
+    let it = readJSON(p, null);
+    if (!it) {
+      // pre-fix stores can hold ids with the trailing '_' — find them by normalized id
+      const legacy = safeReaddir(DIRS.goals).find(f => f.endsWith('.json') && goalId(f.slice(0, -5)) === goalId(args.done));
+      if (legacy) { p = path.join(DIRS.goals, legacy); it = readJSON(p, null); }
+    }
     if (!it) { process.stdout.write(`no such goal: ${args.done}\n`); return; }
     it.status = 'done'; it.updatedAt = new Date().toISOString();
     writeJSON(path.join(DIRS.archive, 'goal-' + it.id + '.json'), it);
     try { fs.unlinkSync(p); } catch {}
     process.stdout.write(`goal done ${it.id}\n`); return;
   }
-  const idForTitle = args.id ? slug(String(args.id)).toLowerCase().slice(0, 48) : null;
+  const idForTitle = args.id ? goalId(args.id) : null;
   const prevForTitle = idForTitle ? readJSON(path.join(DIRS.goals, idForTitle + '.json'), {}) : {};
   const title = args.title || args._[0] || prevForTitle.title;
   if (!title) {
@@ -285,7 +295,7 @@ function cmdGoal(args) {
     return;
   }
   const { project } = context(args);
-  const id = slug(String(args.id || title)).toLowerCase().slice(0, 48);
+  const id = goalId(args.id || title);
   const p = path.join(DIRS.goals, id + '.json');
   const prev = readJSON(p, {});
   const status = String(args.status || prev.status || 'draft').toLowerCase();
