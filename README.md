@@ -102,6 +102,12 @@ The **Overview** is deliberately a triage screen: one line per pending item, eac
 jumping to the product tab that holds the full detail. Blockers and questions
 stay pinned, highlighted, until an agent resolves them.
 
+Signal hygiene is built into the CLI: agents check `ccmd signals [product]`
+before creating one, update the existing signal with `ccmd signal --update <id>`
+instead of duplicating it, and keep each product to at most four open signals.
+Creation remains script-safe (stdout is only the id); duplicate and cap hints go
+to stderr and never block the command.
+
 ## Goals — work that runs while you sleep
 
 Some work can run for *hours* without you toward a clear finish: a big migration,

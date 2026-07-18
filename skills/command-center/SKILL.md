@@ -58,6 +58,13 @@ ccmd signal --kind question --msg "…"
 
 It prints an `id`. When the blocker clears, run `ccmd resolve <id>`.
 
+**Keep signals clean.** Before creating one, run `ccmd signals [product]` (open
+signals include acknowledged ones). If the topic already exists, update it with
+`ccmd signal --update <id> [--msg "…"] [--kind …] [--branch …]` so it reappears
+on the board. Keep at most four open signals per
+product; consolidate or resolve stale ones instead of adding duplicates. Creation
+hints about likely duplicates or an exceeded cap are advisory and go to stderr.
+
 **Every pending user decision = ONE self-contained `question` signal.** Don't
 pile "approve X · decide Y · generate Z" into a report's `--next` — that's
 unreadable. Each signal carries: what to decide/do, the minimum context to
