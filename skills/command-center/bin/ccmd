@@ -145,7 +145,9 @@ function entryPathFromKey(key) {
 // the `ccmd-read:` relay can never mint or traverse to arbitrary files.
 const SEG = '[A-Za-z0-9._@~-]{1,160}';
 const KEY_RE = new RegExp(`^(?:entry:${SEG}/${SEG}|signal:${SEG})$`);
+const SIGNAL_ID_RE = /^[A-Za-z0-9]+-[A-Za-z0-9]+$/;
 function validKeyFormat(key) { return typeof key === 'string' && key.length <= 360 && KEY_RE.test(key); }
+function validSignalId(id) { return typeof id === 'string' && SIGNAL_ID_RE.test(id); }
 function validKey(key) {
   if (!validKeyFormat(key)) return false;
   if (key.startsWith('entry:')) return fs.existsSync(entryPathFromKey(key));
@@ -290,6 +292,7 @@ function cmdReport(args) {
 
 function cmdSignal(args) {
   ensureDirs();
+  if ('update' in args) return cmdSignalUpdate(args);
   const { project, branch } = context(args);
   const kind = (args.kind || 'blocker').toLowerCase() === 'question' ? 'question' : 'blocker';
   const msg = args.msg || args.message || args._[0] || '(no message)';
@@ -302,7 +305,38 @@ function cmdSignal(args) {
   };
   writeJSON(path.join(DIRS.signals, id + '.json'), sig);
   clearDemoMarker();
-  process.stdout.write(`${id}\n`); // print id so the agent can `ccmd resolve <id>`
+  process.stdout.write(`${id}\n`); // stdout stays machine-readable: only the id
+  // Hygiene hints are advisory only. A failure here must never break signal creation.
+  try { signalCreateAdvisory(sig); } catch {}
+}
+
+// Update an open signal in place. Presence matters: an omitted flag preserves its
+// current value. Project is intentionally fixed (moving a signal across products is a footgun).
+function cmdSignalUpdate(args) {
+  const id = typeof args.update === 'string' ? args.update.trim() : '';
+  if (!validSignalId(id)) {
+    process.stderr.write('usage: ccmd signal --update <id> [--msg "…"] [--kind blocker|question] [--branch …]\n');
+    process.exitCode = 1;
+    return;
+  }
+  const p = path.join(DIRS.signals, id + '.json');
+  const sig = readJSON(p, null);
+  if (!sig || sig.resolved) {
+    process.stderr.write(`no such open signal: ${id}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const newMsg = ('msg' in args) ? args.msg : ('message' in args ? args.message : undefined);
+  if (typeof newMsg === 'string') sig.msg = newMsg;
+  if ('kind' in args && typeof args.kind === 'string') {
+    sig.kind = args.kind.toLowerCase() === 'question' ? 'question' : 'blocker';
+  }
+  if ('branch' in args && typeof args.branch === 'string' && args.branch !== '') sig.branch = slug(args.branch);
+  sig.key = sig.key || `signal:${id}`;
+  sig.updatedAt = new Date().toISOString();
+  writeJSON(p, sig);
+  clearSeen(sig.key);
+  process.stdout.write(`updated ${id}\n`);
 }
 
 function cmdResolve(args) {
@@ -317,6 +351,73 @@ function cmdResolve(args) {
   try { fs.unlinkSync(p); } catch {}
   clearSeen(`signal:${id}`);
   process.stdout.write(`resolved ${id}\n`);
+}
+
+// ---------- signal hygiene (list / deduplicate / cap) ----------
+// Unicode alphanumeric tokens, excluding URLs and words shorter than four chars.
+function sigTokens(msg) {
+  return new Set(String(msg || '')
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .split(' ')
+    .filter(w => w.length >= 4));
+}
+function jaccardSim(a, b) {
+  if (!a.size || !b.size) return { j: 0, shared: 0 };
+  let shared = 0;
+  for (const w of a) if (b.has(w)) shared++;
+  return { j: shared / (a.size + b.size - shared), shared };
+}
+
+// Non-blocking creation advisory. It writes only to stderr so stdout remains the id.
+function signalCreateAdvisory(sig) {
+  const open = collect().signals;
+  const prod = productFor(sig.project);
+  const inProduct = open.filter(s => productFor(s.project).id === prod.id);
+  if (inProduct.length > 4) {
+    process.stderr.write(`⚠ ${prod.label}: ${inProduct.length} open signals (>4) — consolidate or resolve some (ccmd signals ${prod.id})\n`);
+  }
+  const mine = sigTokens(sig.msg);
+  let best = null;
+  for (const s of inProduct) {
+    if (s.id === sig.id) continue;
+    const { j, shared } = jaccardSim(mine, sigTokens(s.msg));
+    if (shared >= 3 && j >= 0.55 && (!best || j > best.j)) best = { id: s.id, j };
+  }
+  if (best) {
+    process.stderr.write(`↺ possible duplicate of ${best.id} — if so: ccmd signal --update ${best.id} --msg "…" (or ccmd resolve)\n`);
+  }
+}
+
+// List all open signals, including acknowledged ones, grouped by configured product.
+function cmdSignals(args) {
+  const filter = String(args._[0] || args.project || '').toLowerCase();
+  const groups = new Map();
+  for (const s of collect().signals) {
+    const p = productFor(s.project);
+    if (!groups.has(p.id)) groups.set(p.id, { id: p.id, label: p.label, repos: p.repos || [], sigs: [] });
+    groups.get(p.id).sigs.push(s);
+  }
+  const matches = (g) => !filter || g.id.toLowerCase() === filter ||
+    g.label.toLowerCase() === filter || g.repos.some(r => String(r).toLowerCase() === filter);
+  const ordered = Array.from(groups.values()).filter(matches).sort((a, b) => a.label.localeCompare(b.label));
+  let shown = 0;
+  for (const g of ordered) {
+    const total = g.sigs.length;
+    const visible = g.sigs.filter(s => !s.seen).length;
+    const visibility = visible !== total ? ` · ${visible} on board` : '';
+    const warning = total > 4 ? '  ⚠ >4' : '';
+    process.stdout.write(`\n${g.label} (${g.id}) — ${total} open signal${total !== 1 ? 's' : ''}${visibility}${warning}\n`);
+    g.sigs.sort((a, b) => ((a.updatedAt || a.createdAt || '') < (b.updatedAt || b.createdAt || '') ? -1 : 1));
+    for (const s of g.sigs) {
+      const raw = String(s.msg || '');
+      const oneLine = raw.replace(/\s+/g, ' ').trim().slice(0, 80);
+      process.stdout.write(`  ${s.id}  [${s.kind || '?'}]  ${s.project}  ${oneLine}${raw.length > 80 ? '…' : ''}${s.seen ? '  (✓ seen)' : ''}\n`);
+      shown++;
+    }
+  }
+  if (!shown) process.stdout.write(filter ? `no open signals for "${filter}"\n` : 'no open signals\n');
 }
 
 // ---------- goals: curated async work with a verifiable end state ----------
@@ -608,7 +709,7 @@ function boardModel() {
     .sort((a, b) => (CLS_RANK[a.ui.cls] - CLS_RANK[b.ui.cls]) || (a.updatedAt < b.updatedAt ? 1 : -1));
   // Signals leave the board only when RESOLVED. "read" just dims them and drops
   // them from the urgency surfaces — an unresolved blocker/question stays visible.
-  const allSignals = signals.slice().sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  const allSignals = signals.slice().sort((a, b) => ((a.updatedAt || a.createdAt) < (b.updatedAt || b.createdAt) ? 1 : -1));
   const isUrgent = (s) => !(seenOn && s.seen);
   const visSignals = allSignals;                 // shown in product tabs (read = dimmed)
   const urgentSignals = allSignals.filter(isUrgent); // drive prio + counts + "needs you"
@@ -1273,6 +1374,8 @@ function cmdHelp() {
   ccmd serve [--port 7777]                           # live local dashboard (marking read persists here)  ← default view
   ccmd report --status IN_PROGRESS|BLOCKED|DONE --summary "…" [--task …] [--progress …] --done "a;b" --in-flight "…" --next "…" --blocked "…" [--agent name] [--tier max] [--note "…"]
   ccmd signal --kind blocker|question --msg "…"      # prints an id; clear it with:
+  ccmd signal --update <id> [--msg "…"] [--kind …] [--branch …]  # refresh an existing signal instead of duplicating
+  ccmd signals [product]                              # list open signals by product before creating one
   ccmd resolve <id>
   ccmd goal --title "…" --summary "…" [--prompt-path f] [--links "u;u"] [--prereqs "…"] [--hours N] [--status ready|waiting|draft] [--project p]
   ccmd goal --done <id>                              # curated async-work shelf (pairs with Claude Code's /goal)
@@ -1312,6 +1415,7 @@ function main() {
       case 'demo': return cmdDemo(args);
       case 'report': return cmdReport(args);
       case 'signal': return cmdSignal(args);
+      case 'signals': return cmdSignals(args);
       case 'resolve': return cmdResolve(args);
       case 'render': return cmdRender(args);
       case 'mirror': return cmdMirror(args);
